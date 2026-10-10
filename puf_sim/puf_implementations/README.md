@@ -28,6 +28,34 @@ The following families use deterministic analytical models because the base
 These analytical models are useful for software evaluation and comparison;
 they are not substitutes for measurements from physical devices.
 
+### SRAM enrollment and noise correction
+
+The SRAM model enrolls a mismatch-derived fingerprint with a shortened binary
+BCH code-offset fuzzy extractor. Its public `helper_data` supports reproduction
+from later noisy reads; corrected fingerprint bits are XORed with the challenge
+and SHA-256 hashed as before. BCH correction capacity defaults to one bit and
+can be set to two when constructing an SRAM PUF. The simulated SRAM `noisiness`
+must be between `0.01` and `1.0`; omitting `noisiness` from `create_puf`
+selects `0.01` for SRAM and preserves the zero-noise default for other families.
+
+```python
+sram = create_puf(
+    "sram",
+    n=64,
+    response_bits=16,
+    seed=7,
+    bch_correction_capacity=2,
+)
+public_helper_data = sram.helper_data
+```
+
+The helper data is public by design, but this analytical model does not provide
+a formal entropy guarantee, tamper resistance, or a hardware-calibrated noise
+distribution. A real deployment must validate helper-data leakage and the
+extractor against measured device entropy and environmental conditions. The
+simulation exposes `bch_uncorrectable_reads` and `bch_total_reads` counters so
+that out-of-capacity reads are observable.
+
 ## Python API
 
 Import the factory and create a 64-bit Arbiter PUF:
@@ -43,12 +71,24 @@ responses = puf.eval(challenges)
 print(responses.shape)
 ```
 
-Create a 4-XOR Arbiter PUF, an FF-APUF, and an Interpose PUF:
+Create an XOR Arbiter PUF with two response bits, an FF-APUF, and an Interpose
+PUF. For XOR Arbiter and Interpose PUFs, the lower/output stage chain count
+defaults to the challenge length `n` (64 chains here), or can be set with `k`.
+The implementation raises a smaller explicit `k` to at least `response_bits`,
+then partitions those chains into near-equal groups and combines each group in
+a balanced XOR tree. Thus every output-stage chain contributes once, and the
+response width is independently selected from `k`.
 
 ```python
 from puf_sim.puf_implementations import create_puf
 
-xor_puf = create_puf("xor_apuf", n=64, k=4, seed=1, noisiness=0.05)
+xor_puf = create_puf(
+    "xor_apuf",
+    n=64,
+    response_bits=2,
+    seed=1,
+    noisiness=0.05,
+)
 ff_puf = create_puf(
     "ff_apuf",
     n=64,
@@ -59,6 +99,7 @@ interpose_puf = create_puf(
     "interpose",
     n=64,
     k=4,
+    response_bits=2,
     seed=3,
     interpose_pos=32,
 )
@@ -87,10 +128,26 @@ for family in families:
     print(family, puf.challenge_length, puf.response_length)
 ```
 
-`k` controls the number of chains for XOR, Interpose, and Permutation PUFs.
-`response_bits` controls the response width of the analytical families and the
-number of optical response pixels. `noisiness` applies to native noisy Arbiter
-PUF-based implementations.
+For XOR and Permutation PUFs, `k` is the total number of arbiter chains and
+defaults to the challenge length `n`. `response_bits` divides those chains into
+near-equal groups, with each group producing one output bit through a balanced
+XOR tree; if `k < response_bits`, the chain count is raised to the output width.
+The Permutation PUF uses one fixed challenge permutation per chain. Its original
+curated permutation seeds are retained for up to ten chains. Larger banks use
+a deterministic conjugated cyclic permutation set, which avoids fixed points
+and gives each challenge position a distinct destination across the first `n`
+chains. If more than `n` chains are requested, further unique permutations are
+generated deterministically.
+
+Interpose PUF retains a single upper-stage bit that is inserted into the
+challenge, then uses its `k` lower-stage arbiter chains to produce output
+bits. The lower-stage chains are partitioned and balanced-XORed like XOR
+Arbiter PUF chains; the upper stage remains one chain. `response_bits`
+defaults to one, preserving scalar output. For Interpose PUF, omitted `k`
+defaults the lower-stage count to `n`. `response_bits` also controls the
+response width of the analytical families and the number of optical response
+pixels. `noisiness` controls evaluation noise in supported models; SRAM
+requires at least `0.01`.
 
 The native classes are also available directly:
 
@@ -149,6 +206,7 @@ metric evaluation is provided by `puf_sim.puf_baseline_eval`.
 
 ## Permutation PUF note
 
-The underlying `pypuf` Permutation PUF uses predefined permutation tables for
-specific challenge lengths. Use a supported challenge length, such as `64`,
-when calling `create_puf("permutation", ...)`.
+The Permutation PUF supports the predefined challenge lengths from `16` through
+`256` in steps of two. For up to ten chains it retains the upstream fixed
+permutations; larger chain banks use the deterministic extension described
+above.

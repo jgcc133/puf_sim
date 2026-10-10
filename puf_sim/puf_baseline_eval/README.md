@@ -22,13 +22,19 @@ data metrics.
 from puf_sim.puf_baseline_eval import evaluate_exposed_api
 from puf_sim.puf_implementations import create_puf
 
-puf = create_puf("xor_apuf", n=64, k=4, seed=7)
+puf = create_puf("xor_apuf", n=64, k=4, response_bits=2, seed=7)
 metrics = evaluate_exposed_api(puf, samples=1000, repetitions=17, seed=8)
 
 print(metrics["bias"])
 print(metrics["reliability"].mean())
 print(metrics["total_influence"])
 ```
+
+For an XOR Arbiter PUF, omitting `k` selects `n` chains. The `response_bits`
+argument chooses the number of output bits; all chains are distributed across
+those output bits in near-equal groups and combined with balanced XOR reductions.
+If an explicit `k` is smaller than `response_bits`, the chain count is raised
+to `response_bits`.
 
 For `uniqueness` and `similarity`, pass multiple instances:
 
@@ -120,6 +126,30 @@ The complete report includes `uniqueness`, `steadiness`, `reliability`,
 `uniformity`, `randomness`, `bit_aliasing`, `diffuseness`,
 `probability_of_misidentification`, and all official comparison and Fourier
 metrics where their required inputs are available.
+
+For SRAM, the baseline factory default uses `noisiness=0.01` and BCH
+code-offset correction capacity one. Set these options explicitly to compare
+ECC configurations:
+
+```python
+from puf_sim.puf_baseline_eval import run_baseline_experiment
+
+results = run_baseline_experiment(
+    families=["sram"],
+    n=64,
+    response_bits=16,
+    noisiness=0.01,
+    bch_correction_capacity=2,
+    samples=1000,
+    repetitions=17,
+)
+print(results["sram"]["reliability"].mean())
+```
+
+When `noisiness` is omitted, the baseline uses each family’s factory default
+(0.01 for SRAM, 0.0 for the other families). SRAM itself rejects noise values
+below 0.01. SRAM reports also include the aggregate `bch_total_reads` and
+`bch_uncorrectable_reads` counters for decoder diagnostics.
 
 ## Command line
 

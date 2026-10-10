@@ -10,6 +10,7 @@ from pypuf.io import ChallengeResponseSet
 from pypuf.simulation import Simulation
 
 from puf_sim.puf_implementations import create_puf
+from puf_sim.puf_implementations.analytical import StaticRandomAccessMemoryPUF
 from .exposed import normalize_to_bipolar
 from .report import evaluate_exposed_metrics
 from .writer import save_baseline_report
@@ -27,6 +28,14 @@ DEFAULT_PUF_FAMILIES = (
     "silicon_photonic",
 )
 DEFAULT_INSTANCE_COUNT = 100
+
+
+def _effective_noisiness(family: str, noisiness: Optional[float]) -> float:
+    if noisiness is not None:
+        return noisiness
+    family_key = family.strip().lower().replace("-", "_").replace(" ", "_")
+    return 0.01 if family_key in {"sram", "static_random_access_memory"} else 0.0
+
 
 def _prepare_population_for_metrics(
     population: list[Simulation],
@@ -56,23 +65,33 @@ def _evaluate_family(
     repetitions: int,
     input_noise: float,
     seed: int,
-    k: int,
+    k: Optional[int],
     response_bits: int,
-    noisiness: float,
+    noisiness: Optional[float],
     backend: str,
     device: Optional[int],
     batch_size: Optional[int],
+    bch_correction_capacity: int,
 ) -> tuple[str, Dict[str, Any]]:
     """Create and evaluate one family; suitable for a worker thread."""
     print(f"Evaluating {instances_per_family} instances of {family!r}...")
+    family_key = family.strip().lower().replace("-", "_").replace(" ", "_")
+    effective_k = k
+    if effective_k is None:
+        effective_k = (
+            n
+            if family_key in {"xor_arbiter", "xor_apuf", "interpose", "permutation"}
+            else 2
+        )
     population = [
         create_puf(
             family,
             n=n,
             seed=seed + family_index * instances_per_family + device_index,
-            k=k,
+            k=effective_k,
             response_bits=response_bits,
-            noisiness=noisiness,
+            noisiness=_effective_noisiness(family, noisiness),
+            bch_correction_capacity=bch_correction_capacity,
         )
         for device_index in range(instances_per_family)
     ]
@@ -93,6 +112,15 @@ def _evaluate_family(
         device=device,
         batch_size=batch_size,
     )
+    if isinstance(population[0], StaticRandomAccessMemoryPUF):
+        report["bch_total_reads"] = sum(
+            puf.bch_total_reads for puf in population
+            if isinstance(puf, StaticRandomAccessMemoryPUF)
+        )
+        report["bch_uncorrectable_reads"] = sum(
+            puf.bch_uncorrectable_reads for puf in population
+            if isinstance(puf, StaticRandomAccessMemoryPUF)
+        )
     return family, report
 
 
@@ -118,15 +146,16 @@ def run_baseline_experiment(
     repetitions: int = 17,
     input_noise: float = 0.01,
     seed: int = 20260921,
-    k: int = 2,
+    k: Optional[int] = None,
     response_bits: int = 1,
-    noisiness: float = 0.0,
+    noisiness: Optional[float] = None,
     report_root: Optional[Path | str] = None,
     save_report: bool = True,
     workers: Optional[int] = None,
     backend: str = "numpy",
     device: Optional[int] = None,
     batch_size: Optional[int] = None,
+    bch_correction_capacity: int = 1,
 ) -> Dict[str, Dict[str, Any]]:
     """Evaluate the baseline metrics for a population of each PUF family.
 
@@ -160,6 +189,7 @@ def run_baseline_experiment(
             backend,
             device,
             batch_size,
+            bch_correction_capacity,
         )
         for family_index, family in enumerate(selected_families)
     ]
@@ -179,6 +209,11 @@ def run_baseline_experiment(
             "k": k,
             "response_bits": response_bits,
             "noisiness": noisiness,
+            "effective_noisiness_by_family": {
+                family: _effective_noisiness(family, noisiness)
+                for family in selected_families
+            },
+            "bch_correction_capacity": bch_correction_capacity,
             "workers": max_workers,
             "backend": backend,
             "device": device,

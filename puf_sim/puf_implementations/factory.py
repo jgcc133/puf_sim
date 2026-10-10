@@ -43,11 +43,12 @@ def create_puf(
     family: str,
     n: int,
     seed: int = 0,
-    k: int = 1,
+    k: Optional[int] = None,
     response_bits: int = 1,
-    noisiness: float = 0.0,
+    noisiness: Optional[float] = None,
     ff: Optional[Sequence[Tuple[int, int]]] = None,
     interpose_pos: Optional[int] = None,
+    bch_correction_capacity: int = 1,
 ) -> Simulation:
     """Create a supported PUF using a common constructor interface."""
     key = family.strip().lower().replace("-", "_").replace(" ", "_")
@@ -55,15 +56,28 @@ def create_puf(
         supported = ", ".join(sorted(PUF_IMPLEMENTATIONS))
         raise ValueError(f"Unknown PUF family {family!r}; supported names: {supported}")
 
+    if noisiness is None:
+        effective_noisiness = (
+            0.01 if key in {"sram", "static_random_access_memory"} else 0.0
+        )
+    else:
+        effective_noisiness = noisiness
+
     if key == "optical":
-        return OpticalPUF(n=n, m=response_bits, seed=seed)
+        return OpticalPUF(n=n, m=response_bits, seed=seed, noisiness=effective_noisiness)
     if key == "arbiter":
-        return ArbiterPUF(n=n, seed=seed, noisiness=noisiness)
+        return ArbiterPUF(n=n, seed=seed, noisiness=effective_noisiness)
     if key in {"feed_forward_arbiter", "ff_apuf"}:
         loops = list(ff) if ff is not None else [(n // 3, (2 * n) // 3)]
-        return FeedForwardArbiterPUF(n=n, ff=loops, seed=seed, noisiness=noisiness)
+        return FeedForwardArbiterPUF(n=n, ff=loops, seed=seed, noisiness=effective_noisiness)
     if key in {"xor_arbiter", "xor_apuf"}:
-        return XORArbiterPUF(n=n, k=k, seed=seed, noisiness=noisiness)
+        return XORArbiterPUF(
+            n=n,
+            k=k,
+            seed=seed,
+            noisiness=effective_noisiness,
+            response_bits=response_bits,
+        )
     if key == "interpose":
         return InterposePUF(
             n=n,
@@ -71,18 +85,46 @@ def create_puf(
             k_up=1,
             interpose_pos=interpose_pos or n // 2,
             seed=seed,
-            noisiness=noisiness,
+            noisiness=effective_noisiness,
+            response_bits=response_bits,
         )
     if key == "permutation":
-        return PermutationPUF(n=n, k=k, seed=seed, noisiness=noisiness)
+        return PermutationPUF(
+            n=n,
+            k=k,
+            seed=seed,
+            noisiness=effective_noisiness,
+            response_bits=response_bits,
+        )
     if key in {"ring_oscillator", "ro_puf"}:
-        return RingOscillatorPUF(n=n, response_bits=response_bits, seed=seed)
+        return RingOscillatorPUF(
+            n=n,
+            response_bits=response_bits,
+            seed=seed,
+            noisiness=effective_noisiness,
+        )
     if key in {"sram", "static_random_access_memory"}:
-        return StaticRandomAccessMemoryPUF(n=n, response_bits=response_bits, seed=seed)
+        return StaticRandomAccessMemoryPUF(
+            n=n,
+            response_bits=response_bits,
+            seed=seed,
+            noisiness=effective_noisiness,
+            bch_correction_capacity=bch_correction_capacity,
+        )
     if key in {"memristive", "memristive_puf"}:
-        return MemristivePUF(n=n, response_bits=response_bits, seed=seed)
+        return MemristivePUF(
+            n=n,
+            response_bits=response_bits,
+            seed=seed,
+            noisiness=effective_noisiness,
+        )
     if key == "silicon_photonic":
-        return SiliconPhotonicPUF(n=n, response_bits=response_bits, seed=seed)
+        return SiliconPhotonicPUF(
+            n=n,
+            response_bits=response_bits,
+            seed=seed,
+            noisiness=effective_noisiness,
+        )
 
     raise AssertionError("PUF family registry and factory are inconsistent")
 
