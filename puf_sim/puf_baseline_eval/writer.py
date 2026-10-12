@@ -5,8 +5,9 @@ import csv
 import json
 import os
 from datetime import datetime
+from itertools import chain
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -47,6 +48,7 @@ def save_baseline_report(
     parameters: Mapping[str, Any],
     families: Sequence[str],
     report_root: Path | str | None = None,
+    responses: Mapping[str, Iterable[np.ndarray]] | None = None,
 ) -> Path:
     """Save one timestamped baseline report in the reports data directory."""
     root = DEFAULT_REPORT_ROOT if report_root is None else Path(report_root)
@@ -96,6 +98,75 @@ def save_baseline_report(
                 row["bit_aliasing"] = str(values.tolist())
 
             writer.writerow(row)
+
+    if responses:
+        single_family = len(responses) == 1
+        repetitions = int(parameters["repetitions"])
+        samples = int(parameters["samples"])
+        expected_rows_per_instance = samples * repetitions
+        for index, (family, chunks) in enumerate(responses.items(), start=1):
+            chunk_iterator = iter(chunks)
+            first_chunk = next(chunk_iterator, None)
+            if first_chunk is None:
+                raise ValueError(f"No response rows were generated for {family!r}.")
+            first_values = np.asarray(first_chunk)
+            if first_values.ndim != 2 or first_values.shape[1] < 1:
+                raise ValueError(
+                    "Response CSV data must be a two-dimensional matrix "
+                    "with at least one response bit."
+                )
+            if single_family:
+                filename = "responses.csv"
+            else:
+                safe_family = "".join(
+                    character if character.isalnum() or character in "-_" else "_"
+                    for character in family
+                ).strip("_")
+                filename = f"responses_{index}_{safe_family}.csv"
+
+            with (report_directory / filename).open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                writer = csv.writer(handle)
+                writer.writerow(
+                    ["label"]
+                    + [
+                        f"bit_{bit_index}"
+                        for bit_index in range(first_values.shape[1])
+                    ]
+                )
+                for instance_index, chunk in enumerate(
+                    chain((first_values,), chunk_iterator), start=1
+                ):
+                    values = np.asarray(chunk)
+                    if (
+                        values.ndim != 2
+                        or values.shape[1] != first_values.shape[1]
+                    ):
+                        raise ValueError(
+                            "Response CSV chunks must have matching "
+                            "two-dimensional shapes."
+                        )
+                    if not np.issubdtype(values.dtype, np.integer) or np.any(
+                        (values < 0) | (values > 1)
+                    ):
+                        raise ValueError("Response CSV values must be binary 0/1.")
+                    if values.shape[0] != expected_rows_per_instance:
+                        raise ValueError(
+                            f"Expected {expected_rows_per_instance} response rows "
+                            f"for instance {instance_index} of {family!r}, "
+                            f"got {values.shape[0]}."
+                        )
+                    for row_index, row in enumerate(values):
+                        sample_index, repetition_index = divmod(
+                            row_index, repetitions
+                        )
+                        label = (
+                            f"family {family}, instance {instance_index}, "
+                            f"sample {sample_index + 1}, "
+                            f"repetition {repetition_index + 1}"
+                        )
+                        writer.writerow([label, *row.tolist()])
 
     return report_directory
 

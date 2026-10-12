@@ -100,6 +100,12 @@ summarized using the baseline criteria:
 - similarity, bias, influence, total influence, and noise sensitivity when
   applicable
 
+The `randomness` score is the mean normalized entropy of the 0/1 balance
+within each complete response string, averaged across all device/challenge
+responses. It is distinct from `bit_aliasing`, which measures the skew at each
+response-bit position across the population. A one-bit response has zero
+within-response entropy by definition.
+
 The complete report is returned as a dictionary:
 
 ```python

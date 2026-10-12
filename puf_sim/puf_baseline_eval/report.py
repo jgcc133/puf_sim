@@ -12,8 +12,8 @@ from puf_sim.puf_backend import get_backend
 
 from .derived import (
     binary_entropy,
-    bit_aliasing,
     hamming_distance_distribution,
+    majority_vote_repetitions,
     probability_of_misidentification,
     response_matrix,
 )
@@ -38,6 +38,8 @@ def evaluate_exposed_metrics(
         raise ValueError("At least one PUF instance is required.")
     if batch_size is not None and batch_size < 1:
         raise ValueError("batch_size must be at least one or None.")
+    if repetitions < 1:
+        raise ValueError("repetitions must be at least one.")
 
     selected_backend = get_backend(backend, device=device)
     xp = selected_backend.xp
@@ -53,6 +55,22 @@ def evaluate_exposed_metrics(
         [response_matrix(response, selected_backend) for response in population_responses],
         axis=0,
     )
+    tie_rng = np.random.default_rng(seed)
+    bit_one_counts = np.zeros(instance.response_length, dtype=np.int64)
+    for puf in population:
+        repeated_responses = np.stack(
+            [
+                selected_backend.asnumpy(
+                    selected_backend.eval_array(puf, challenges)
+                )
+                for _ in range(repetitions)
+            ],
+            axis=-1,
+        )
+        voted_responses = majority_vote_repetitions(repeated_responses, tie_rng)
+        bit_one_counts += np.count_nonzero(voted_responses > 0, axis=0)
+    repeated_bit_aliasing = bit_one_counts / (len(population) * samples)
+
     result = evaluate_exposed_api(
         instance,
         instances=population,
@@ -68,7 +86,7 @@ def evaluate_exposed_metrics(
             population_responses.reshape(-1, instance.response_length),
             selected_backend,
         ),
-        "bit_aliasing": bit_aliasing(population_responses, selected_backend),
+        "bit_aliasing": repeated_bit_aliasing,
         "probability_of_misidentification": probability_of_misidentification(
             population_responses,
             selected_backend,
@@ -86,8 +104,9 @@ def evaluate_exposed_metrics(
         "batch_size": step,
     })
     result["steadiness"] = result["reliability"]
-    result["diffuseness"] = result["total_influence"] / max(
-        1, instance.challenge_length
+    result["diffuseness"] = round(
+        result["total_influence"] / max(1, instance.challenge_length),
+        6,
     )
     return result
 

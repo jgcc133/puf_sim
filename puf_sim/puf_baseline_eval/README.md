@@ -72,13 +72,16 @@ print(metrics["correlation"])
 
 The package also provides metrics not directly exposed by `pypuf.metrics`:
 
-- `binary_entropy`: normalized response-bit entropy, where `1.0` is ideal
-- `bit_aliasing`: absolute cross-device response-bit bias, where `0.0` is ideal
+- `binary_entropy`: mean normalized entropy of the 0/1 balance within each
+  complete response; `1.0` means each response is evenly balanced
+- `bit_aliasing`: fraction of majority-voted `1` responses for each output bit
+  across devices and challenges; `0.5` is balanced
 - `hamming_distance_distribution`: normalized pairwise response distances
 - `probability_of_misidentification`: complete-response impostor collision rate
 - `uniformity`: derived as `1 - mean(abs(bias))`
 - `steadiness`: an alias for the reliability result
-- `diffuseness`: normalized `total_influence`
+- `diffuseness`: `total_influence` divided by challenge length, reported to six
+  decimal places
 
 Call the individual helpers with response data:
 
@@ -92,19 +95,34 @@ from puf_sim.puf_baseline_eval import (
 )
 
 responses = np.array([
-    [[-1], [1], [-1]],
-    [[1], [1], [-1]],
+    [[-1, 1, -1, 1], [1, 1, -1, -1], [-1, -1, -1, -1]],
+    [[1, 1, 1, 1], [1, -1, 1, -1], [-1, -1, 1, 1]],
 ])
-print(binary_entropy(responses.reshape(-1, 1)))
+print(binary_entropy(responses))
 print(bit_aliasing(responses))
-print(hamming_distance_distribution(responses.reshape(-1, 1)))
+print(hamming_distance_distribution(responses.reshape(-1, 4)))
 print(probability_of_misidentification(responses))
 ```
+
+`binary_entropy` scores each response string independently from its fraction
+of positive bits, then averages those scores across responses. It measures
+within-response balance, not per-position bias (reported by `bit_aliasing`)
+or independence between bits. A one-bit response has zero within-response
+entropy by definition.
 
 ## Complete report
 
 `evaluate_exposed_metrics()` combines the official and derived metrics in one
 dictionary:
+
+`run_baseline_experiment()` evaluates responses through a metric-only adapter:
+zero-valued bits are mapped to `-1`, and positive bits to `1`, before metric
+calculations. This leaves each PUF implementation's own `eval()` output
+unchanged. Optical responses are first median-thresholded, then exposed in
+bipolar form. For `bit_aliasing`, each device/challenge/bit is majority-voted
+across `repetitions` before aggregation. Exact ties are resolved by independent
+50/50 draws from an RNG seeded with the report's `seed`, making the result
+reproducible for a fixed run configuration.
 
 ```python
 from puf_sim.puf_baseline_eval import evaluate_exposed_metrics

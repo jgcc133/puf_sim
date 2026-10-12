@@ -3,6 +3,7 @@ from .derived import (
     binary_entropy,
     bit_aliasing,
     hamming_distance_distribution,
+    majority_vote_repetitions,
     probability_of_misidentification,
     response_matrix,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "evaluate_exposed_metrics",
     "evaluate_puf_population",
     "hamming_distance_distribution",
+    "majority_vote_repetitions",
     "probability_of_misidentification",
     "response_matrix",
     "run_baseline_experiment",

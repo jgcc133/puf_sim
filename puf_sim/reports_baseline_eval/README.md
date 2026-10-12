@@ -8,12 +8,20 @@ puf_sim/reports_baseline_val/
 └── yyyy mm dd Report x - All PUFs/
     ├── parameters.json
     ├── results.json
-    └── summary.csv
+    ├── summary.csv
+    └── responses.csv
 ```
 
 For a selected family subset, the folder label is `Selected PUFs` instead of
 `All PUFs`. The folder name includes the date, sequential report number, and
 family selection. Parameter values are stored in `parameters.json`:
+
+For a single-family run, `responses.csv` contains one row for each instance,
+challenge sample, and repetition, in that order. The first `label` column
+identifies the family and one-based instance, sample, and repetition indices;
+remaining columns are response bits encoded as `0` or `1`. For a multi-family
+run, each family has its own `responses_<index>_<family>.csv` file because
+response widths can differ.
 
 - `instances_per_family`
 - `n`
@@ -69,3 +77,6 @@ run_baseline_experiment(save_report=False)
 - `results.json` stores the complete metric arrays and values.
 - `summary.csv` stores one row per family, reducing array-valued metrics to
   their mean for convenient spreadsheet analysis.
+- `responses.csv` (or one `responses_<index>_<family>.csv` per family) stores
+  the binary output response rows. Its number of data rows is
+  `instances_per_family * samples * repetitions`.

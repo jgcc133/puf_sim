@@ -52,6 +52,26 @@ class NormalizedResponseSimulation(Simulation):
         return np.where(responses >= self._threshold, 1, -1).astype(np.int8)
 
 
+class BipolarResponseSimulation(Simulation):
+    """Expose a simulation's discrete responses as bipolar values for metrics."""
+
+    def __init__(self, instance: Simulation) -> None:
+        super().__init__()
+        self._instance = instance
+
+    @property
+    def challenge_length(self) -> int:
+        return self._instance.challenge_length
+
+    @property
+    def response_length(self) -> int:
+        return self._instance.response_length
+
+    def eval(self, challenges: np.ndarray) -> np.ndarray:
+        responses = np.asarray(self._instance.eval(challenges))
+        return np.where(responses > 0, 1, -1).astype(np.int8)
+
+
 def normalize_to_bipolar(
     instance: Simulation, seed: int = 0, calibration_samples: int = 1000
 ) -> Simulation:
@@ -127,4 +147,9 @@ def evaluate_exposed_api(
     return result
 
 
-__all__ = ["evaluate_exposed_api", "NormalizedResponseSimulation", "normalize_to_bipolar"]
+__all__ = [
+    "BipolarResponseSimulation",
+    "evaluate_exposed_api",
+    "NormalizedResponseSimulation",
+    "normalize_to_bipolar",
+]
