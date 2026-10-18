@@ -49,6 +49,7 @@ def create_puf(
     ff: Optional[Sequence[Tuple[int, int]]] = None,
     interpose_pos: Optional[int] = None,
     bch_correction_capacity: int = 1,
+    hash_responses: bool = True,
 ) -> Simulation:
     """Create a supported PUF using a common constructor interface."""
     key = family.strip().lower().replace("-", "_").replace(" ", "_")
@@ -66,10 +67,21 @@ def create_puf(
     if key == "optical":
         return OpticalPUF(n=n, m=response_bits, seed=seed, noisiness=effective_noisiness)
     if key == "arbiter":
-        return ArbiterPUF(n=n, seed=seed, noisiness=effective_noisiness)
+        return ArbiterPUF(
+            n=n,
+            seed=seed,
+            noisiness=effective_noisiness,
+            response_bits=response_bits,
+        )
     if key in {"feed_forward_arbiter", "ff_apuf"}:
         loops = list(ff) if ff is not None else [(n // 3, (2 * n) // 3)]
-        return FeedForwardArbiterPUF(n=n, ff=loops, seed=seed, noisiness=effective_noisiness)
+        return FeedForwardArbiterPUF(
+            n=n,
+            ff=loops,
+            seed=seed,
+            noisiness=effective_noisiness,
+            response_bits=response_bits,
+        )
     if key in {"xor_arbiter", "xor_apuf"}:
         return XORArbiterPUF(
             n=n,
@@ -110,6 +122,7 @@ def create_puf(
             seed=seed,
             noisiness=effective_noisiness,
             bch_correction_capacity=bch_correction_capacity,
+            hash_responses=hash_responses,
         )
     if key in {"memristive", "memristive_puf"}:
         return MemristivePUF(

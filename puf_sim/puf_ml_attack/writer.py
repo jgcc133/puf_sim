@@ -6,8 +6,9 @@ import json
 import os
 import re
 from datetime import datetime
+from itertools import chain
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -39,8 +40,11 @@ def save_ml_attack_report(
     families: Sequence[str],
     scenario: str = "general",
     report_root: str | Path | None = None,
+    responses: Mapping[
+        str, Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]
+    ] | None = None,
 ) -> Path:
-    """Save a timestamped attack report under a scenario folder."""
+    """Save a timestamped attack report and optional test-response comparisons."""
     root = DEFAULT_REPORT_ROOT if report_root is None else Path(report_root)
     if os.name == "nt" and root.root and not root.drive:
         project_root = DEFAULT_REPORT_ROOT.parents[1]
@@ -80,6 +84,103 @@ def save_ml_attack_report(
                 for key, value in report.items()
             })
             writer.writerow(row)
+
+    if responses:
+        single_family = len(responses) == 1
+        expected_instances = int(parameters["puf_instances"])
+        expected_samples = int(parameters["test_samples"])
+        for index, (family, chunks) in enumerate(responses.items(), start=1):
+            chunk_iterator = iter(chunks)
+            first_chunk = next(chunk_iterator, None)
+            if first_chunk is None:
+                raise ValueError(f"No test response rows were generated for {family!r}.")
+            first_puf, first_attack, first_matches = (
+                np.asarray(values) for values in first_chunk
+            )
+            if (
+                first_puf.ndim != 2
+                or first_puf.shape[1] < 1
+                or first_attack.shape != first_puf.shape
+                or first_matches.shape != (first_puf.shape[0],)
+            ):
+                raise ValueError(
+                    "Test response data must contain matching two-dimensional "
+                    "PUF and attack arrays plus one match value per sample."
+                )
+            if single_family:
+                filename = "responses.csv"
+            else:
+                safe_family = "".join(
+                    character if character.isalnum() or character in "-_" else "_"
+                    for character in family
+                ).strip("_")
+                filename = f"responses_{index}_{safe_family}.csv"
+
+            response_columns = (
+                [
+                    f"puf_output_{bit_index}"
+                    for bit_index in range(first_puf.shape[1])
+                ]
+                if family.strip().lower() == "optical"
+                else [
+                    f"bit_{bit_index}"
+                    for bit_index in range(first_puf.shape[1])
+                ]
+            )
+            attack_columns = [
+                f"ml_{column}" for column in response_columns
+            ]
+            with (report_directory / filename).open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["label", *response_columns, *attack_columns, "match"])
+                instance_chunks = enumerate(chain((first_chunk,), chunk_iterator), start=1)
+                for instance_index, chunk in instance_chunks:
+                    puf_values, attack_values, row_matches = (
+                        np.asarray(values) for values in chunk
+                    )
+                    if (
+                        puf_values.ndim != 2
+                        or puf_values.shape[1] != first_puf.shape[1]
+                        or attack_values.shape != puf_values.shape
+                        or row_matches.shape != (puf_values.shape[0],)
+                    ):
+                        raise ValueError(
+                            "Response chunks must have matching PUF/attack "
+                            "dimensions and one match value per sample."
+                        )
+                    if puf_values.shape[0] != expected_samples:
+                        raise ValueError(
+                            f"Expected {expected_samples} test response rows for "
+                            f"instance {instance_index} of {family!r}, got "
+                            f"{puf_values.shape[0]}."
+                        )
+                    if (
+                        not np.issubdtype(puf_values.dtype, np.number)
+                        or not np.issubdtype(attack_values.dtype, np.number)
+                        or not np.all(np.isfinite(puf_values))
+                        or not np.all(np.isfinite(attack_values))
+                    ):
+                        raise ValueError("Response CSV values must be finite numbers.")
+                    for sample_index, (puf_row, attack_row, matched) in enumerate(
+                        zip(puf_values, attack_values, row_matches), start=1
+                    ):
+                        label = (
+                            f"family {family}, instance {instance_index}, "
+                            f"sample {sample_index}, repetition 1"
+                        )
+                        writer.writerow([
+                            label,
+                            *puf_row.tolist(),
+                            *attack_row.tolist(),
+                            int(matched),
+                        ])
+            if instance_index != expected_instances:
+                raise ValueError(
+                    f"Expected {expected_instances} response chunks for {family!r}, "
+                    f"got {instance_index}."
+                )
     return report_directory
 
 

@@ -128,51 +128,124 @@ class AgentTrainer(_BaseAgentTrainer):
 
 
 class TorchPUFModel(_BaseTorchPUFModel):
-    """Predict continuous optical intensities, de-normalizing the regression output."""
+    """Predict continuous optical intensities from the fitted regression model."""
 
     def eval(self, challenges: np.ndarray) -> np.ndarray:
         import torch
 
         reference = self.models[0]
+        inputs = torch.as_tensor(challenges, dtype=torch.float32, device=self.device)
+        if hasattr(reference, "quadratic_factor"):
+            with torch.no_grad():
+                predictions = torch.stack(
+                    [model(inputs) for model in self.models]
+                ).mean(dim=0)
+            return predictions.cpu().numpy()
+
         normalized_features = (
             feature_map(challenges) - reference.feature_mean
         ) / reference.feature_scale
-        inputs = torch.as_tensor(normalized_features, dtype=torch.float32, device=self.device)
+        inputs = torch.as_tensor(
+            normalized_features, dtype=torch.float32, device=self.device
+        )
         with torch.no_grad():
             predictions = torch.stack([model(inputs) for model in self.models]).mean(dim=0)
         predictions = predictions.cpu().numpy()
         return predictions * reference.label_scale + reference.label_mean
 
 
-def bootstrap_linear_model(
-    challenges: np.ndarray, responses: np.ndarray, response_bits: int, device: Any
-) -> Any:
-    """Exact closed-form least-squares fit in the pairwise-product feature space.
-
-    Optical PUF intensities are an exact linear function of the pairwise
-    challenge-bit products (see module docstring), so this direct solve
-    (mirroring ``pypuf.attack.LeastSquaresRegression``) fits the target far
-    more reliably than gradient descent through a mandatory nonlinear hidden
-    layer, which fights against an already-linear relationship.
-    """
+def _quadratic_optical_regressor(factors: np.ndarray, device: Any) -> Any:
     import torch
     from torch import nn
 
-    features = np.asarray(feature_map(challenges), dtype=np.float64)
-    response_matrix = np.asarray(responses, dtype=np.float64).reshape(len(responses), response_bits)
-    linear_map = np.linalg.pinv(features) @ response_matrix
+    class QuadraticModule(nn.Module):
+        def __init__(self, initial_factors: np.ndarray, target_device: Any):
+            super().__init__()
+            self.quadratic_factor = nn.Parameter(
+                torch.as_tensor(
+                    initial_factors, dtype=torch.float32, device=target_device
+                )
+            )
 
-    linear_layer = nn.Linear(features.shape[1], response_bits, bias=False).to(device)
-    with torch.no_grad():
-        linear_layer.weight.copy_(
-            torch.as_tensor(linear_map.T, dtype=torch.float32, device=device)
+        def forward(self, challenges: Any) -> Any:
+            projected = torch.einsum(
+                "bn,mnr->bmr", challenges, self.quadratic_factor
+            )
+            return projected.square().sum(dim=-1)
+
+    return QuadraticModule(factors, device)
+
+
+def bootstrap_linear_model(
+    challenges: np.ndarray, responses: np.ndarray, response_bits: int, device: Any
+) -> Any:
+    """Fit optical intensities as rank-two quadratic forms.
+
+    Each response is ``|x @ t|**2`` and can therefore be written as
+    ``x.T @ Q @ x`` for a positive-semidefinite matrix ``Q`` of rank at most
+    two. Fitting that factorized form avoids materializing the much larger
+    pairwise-feature design matrix used by a generic pseudoinverse.
+    """
+    import torch
+
+    challenge_matrix = np.asarray(challenges)
+    response_matrix = np.asarray(responses, dtype=np.float64).reshape(
+        len(challenge_matrix), response_bits
+    )
+    sample_count, challenge_length = challenge_matrix.shape
+    cross_moments = np.zeros(
+        (response_bits, challenge_length, challenge_length), dtype=np.float64
+    )
+    batch_size = min(8192, sample_count)
+    for start in range(0, sample_count, batch_size):
+        stop = min(start + batch_size, sample_count)
+        challenge_batch = np.asarray(challenge_matrix[start:stop], dtype=np.float64)
+        response_batch = response_matrix[start:stop]
+        for bit in range(response_bits):
+            weighted_challenges = challenge_batch * response_batch[:, bit, None]
+            cross_moments[bit] += weighted_challenges.T @ challenge_batch
+
+    factors = np.empty((response_bits, challenge_length, 2), dtype=np.float64)
+    for bit in range(response_bits):
+        quadratic_form = (
+            cross_moments[bit] + cross_moments[bit].T
+        ) / (4.0 * sample_count)
+        np.fill_diagonal(
+            quadratic_form,
+            response_matrix[:, bit].mean() / challenge_length,
         )
-    feature_count = features.shape[1]
-    linear_layer.feature_mean = np.zeros(feature_count, dtype=np.float32)
-    linear_layer.feature_scale = np.ones(feature_count, dtype=np.float32)
-    linear_layer.label_mean = np.zeros(response_bits, dtype=np.float32)
-    linear_layer.label_scale = np.ones(response_bits, dtype=np.float32)
-    return linear_layer
+        eigenvalues, eigenvectors = np.linalg.eigh(quadratic_form)
+        top_eigenvalues = np.argsort(eigenvalues)[-2:]
+        factors[bit] = eigenvectors[:, top_eigenvalues] * np.sqrt(
+            np.maximum(eigenvalues[top_eigenvalues], 0.0)
+        )[None, :]
+
+    model = _quadratic_optical_regressor(factors, device)
+    training_inputs = torch.as_tensor(
+        challenge_matrix, dtype=torch.float32, device=device
+    )
+    training_labels = torch.as_tensor(
+        response_matrix, dtype=torch.float32, device=device
+    )
+    optimizer = torch.optim.LBFGS(
+        model.parameters(),
+        lr=0.8,
+        max_iter=100,
+        tolerance_grad=1e-9,
+        tolerance_change=1e-12,
+        line_search_fn="strong_wolfe",
+    )
+
+    def closure() -> Any:
+        optimizer.zero_grad()
+        loss = torch.nn.functional.mse_loss(
+            model(training_inputs), training_labels
+        )
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    return model
 
 
 def pair_accuracy(model: Simulation, dataset: ChallengeResponseSet) -> float:

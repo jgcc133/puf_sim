@@ -7,7 +7,10 @@ from pypuf.io import random_inputs
 from pypuf.metrics import reliability
 from pypuf.simulation import InterposePUF as ReferenceInterposePUF
 from pypuf.simulation import PermutationPUF as ReferencePermutationPUF
+from pypuf.simulation import Simulation
+from puf_sim.puf_backend import get_backend, xpu_available
 from puf_sim.puf_implementations import StaticRandomAccessMemoryPUF, create_puf
+from puf_sim.puf_implementations.analytical import SiliconPhotonicPUF
 from puf_sim.puf_implementations.fuzzy_extractor import (
     BCHCodeOffsetFuzzyExtractor,
     BinaryBCHCode,
@@ -44,6 +47,59 @@ def test_same_seed_reproduces_responses(family: str, response_bits: int) -> None
     )
     second = np.asarray(same_device.eval(challenges))
     np.testing.assert_array_equal(first, second)
+
+
+def test_ff_apuf_generates_response_bits_from_sequential_lanes() -> None:
+    n = 12
+    response_bits = 4
+    seed = 71
+    ff = [(4, 8)]
+    challenges = random_inputs(n=n, N=32, seed=73)
+    puf = create_puf(
+        "ff_apuf",
+        n=n,
+        response_bits=response_bits,
+        seed=seed,
+        ff=ff,
+        noisiness=0.0,
+    )
+    expected = np.column_stack([
+        create_puf(
+            "ff_apuf",
+            n=n,
+            response_bits=1,
+            seed=Simulation.seed(
+                "FeedForwardArbiterPUF response bit "
+                f"{bit_index} seed {seed}"
+            ) if bit_index else seed,
+            ff=ff,
+            noisiness=0.0,
+        ).eval(challenges)
+        for bit_index in range(response_bits)
+    ])
+
+    assert puf.response_length == response_bits
+    assert np.asarray(puf.eval(challenges)).shape == (len(challenges), response_bits)
+    np.testing.assert_array_equal(puf.eval(challenges), expected)
+
+
+@pytest.mark.skipif(not xpu_available(), reason="Intel XPU backend is unavailable")
+def test_ff_apuf_xpu_evaluation_preserves_multiple_response_bits() -> None:
+    backend = get_backend("torch_xpu", device=0)
+    puf = create_puf(
+        "ff_apuf",
+        n=12,
+        response_bits=3,
+        seed=83,
+        ff=[(4, 8)],
+        noisiness=0.0,
+    )
+    challenges = random_inputs(n=12, N=16, seed=89)
+
+    actual = backend.asnumpy(backend.eval_array(puf, challenges))
+
+    assert actual.shape == (len(challenges), 3)
+    np.testing.assert_array_equal(actual, puf.eval(challenges))
 
 
 def test_xor_arbiter_response_bits_partition_all_chains() -> None:
@@ -244,6 +300,44 @@ def test_noisiness_introduces_repeated_read_variation(
     assert np.any(first != second)
 
 
+@pytest.mark.skipif(not xpu_available(), reason="Intel XPU backend is unavailable")
+def test_silicon_photonic_xpu_batch_uses_cached_calibration_and_noise():
+    backend = get_backend("torch_xpu", device=0)
+    pufs = [
+        SiliconPhotonicPUF(
+            n=16,
+            response_bits=3,
+            seed=53 + index,
+            noisiness=0.2,
+            calibration_samples=32,
+            calibration_seed=59,
+        )
+        for index in range(2)
+    ]
+    challenges = random_inputs(n=16, N=8, seed=61)
+    responses = SiliconPhotonicPUF.eval_population_backend(
+        pufs,
+        challenges,
+        backend,
+        batch_size=1,
+    )
+
+    assert tuple(responses.shape) == (2, 8, 3)
+    for puf in pufs:
+        expected_reference = np.median(
+            np.abs(
+                random_inputs(
+                    n=16,
+                    N=32,
+                    seed=59,
+                ) @ puf.transfer_matrix
+            ) ** 2,
+            axis=0,
+        )
+        np.testing.assert_allclose(puf.reference, expected_reference, rtol=1e-5, atol=1e-5)
+    assert set(np.unique(backend.asnumpy(responses))).issubset({-1, 1})
+
+
 def test_sram_startup_state_is_derived_from_differential_transistor_mismatch() -> None:
     puf = StaticRandomAccessMemoryPUF(
         n=8,
@@ -301,6 +395,30 @@ def test_sram_hashes_challenge_xor_startup_fingerprint() -> None:
     np.testing.assert_array_equal(actual, np.asarray(expected, dtype=np.int8))
 
 
+def test_sram_can_return_unhashed_challenge_xor_startup_fingerprint() -> None:
+    puf = create_puf(
+        "sram",
+        n=8,
+        response_bits=8,
+        seed=47,
+        noisiness=0.0,
+        hash_responses=False,
+    )
+    challenges = random_inputs(n=8, N=32, seed=53)
+    combined_bits = np.logical_xor(challenges > 0, puf._power_up_state > 0)
+    expected = np.where(combined_bits, 1, -1).astype(np.int8)
+
+    actual = puf.eval(challenges)
+
+    assert actual.shape == (len(challenges), 8)
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_unhashed_sram_response_width_cannot_exceed_challenge_width() -> None:
+    with pytest.raises(ValueError, match="cannot have more bits"):
+        create_puf("sram", n=8, response_bits=9, hash_responses=False)
+
+
 def test_sram_mismatch_sigma_must_be_positive() -> None:
     with pytest.raises(ValueError, match="transistor_mismatch_sigma"):
         StaticRandomAccessMemoryPUF(
@@ -340,10 +458,17 @@ def test_code_offset_fuzzy_extractor_reproduces_fingerprint() -> None:
     assert extractor.helper_data.shape == fingerprint.shape
 
 
-def test_sram_default_noise_and_minimum_are_one_percent() -> None:
+def test_sram_default_noise_and_zero_noise_are_supported() -> None:
     assert create_puf("sram", n=64).noisiness == 0.01
-    with pytest.raises(ValueError, match="between 0.01 and 1.0"):
-        StaticRandomAccessMemoryPUF(n=64, noisiness=0.009)
+    noiseless_puf = create_puf("sram", n=64, noisiness=0.0)
+    assert noiseless_puf.noisiness == 0.0
+    challenges = random_inputs(n=64, N=32, seed=67)
+    first = noiseless_puf.eval(challenges)
+    second = noiseless_puf.eval(challenges)
+    np.testing.assert_array_equal(first, second)
+
+    with pytest.raises(ValueError, match="between 0.0 and 1.0"):
+        StaticRandomAccessMemoryPUF(n=64, noisiness=-0.001)
 
 
 def test_sram_reliability_exceeds_90_percent_at_one_percent_noise() -> None:

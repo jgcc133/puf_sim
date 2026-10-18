@@ -73,12 +73,18 @@ print(metrics["correlation"])
 The package also provides metrics not directly exposed by `pypuf.metrics`:
 
 - `binary_entropy`: mean normalized entropy of the 0/1 balance within each
-  complete response; `1.0` means each response is evenly balanced
+  complete response; `1.0` means each response is evenly balanced. This helper
+  is not the report's `randomness` metric.
 - `bit_aliasing`: fraction of majority-voted `1` responses for each output bit
   across devices and challenges; `0.5` is balanced
+- `cross_challenge_randomness`: one minus the mean absolute Pearson
+  correlation across distinct challenge pairs, correlating each output bit's
+  majority-voted responses across devices; `1.0` means no measured
+  cross-challenge correlation
 - `hamming_distance_distribution`: normalized pairwise response distances
 - `probability_of_misidentification`: complete-response impostor collision rate
-- `uniformity`: derived as `1 - mean(abs(bias))`
+- `uniformity`: mean fraction of majority-voted `1` responses across
+  challenge-level population responses and output bits; `0.5` is balanced
 - `steadiness`: an alias for the reliability result
 - `diffuseness`: `total_influence` divided by challenge length, reported to six
   decimal places
@@ -90,6 +96,7 @@ import numpy as np
 from puf_sim.puf_baseline_eval import (
     binary_entropy,
     bit_aliasing,
+    cross_challenge_randomness,
     hamming_distance_distribution,
     probability_of_misidentification,
 )
@@ -100,6 +107,7 @@ responses = np.array([
 ])
 print(binary_entropy(responses))
 print(bit_aliasing(responses))
+print(cross_challenge_randomness(responses))
 print(hamming_distance_distribution(responses.reshape(-1, 4)))
 print(probability_of_misidentification(responses))
 ```
@@ -108,7 +116,14 @@ print(probability_of_misidentification(responses))
 of positive bits, then averages those scores across responses. It measures
 within-response balance, not per-position bias (reported by `bit_aliasing`)
 or independence between bits. A one-bit response has zero within-response
-entropy by definition.
+entropy by definition. The report's `uniformity` and `randomness` values are
+both computed after majority-voting repetitions for each device/challenge/bit.
+`uniformity` averages each challenge's fraction of positive responses across
+the population and output bits into one scalar. `randomness` correlates the
+response vectors for each pair of distinct challenges across devices and
+scores lower absolute correlation higher. Challenge pairs with a constant
+response vector are excluded; if no variable pairs remain, the score is
+`0.0`.
 
 ## Complete report
 
@@ -119,10 +134,14 @@ dictionary:
 zero-valued bits are mapped to `-1`, and positive bits to `1`, before metric
 calculations. This leaves each PUF implementation's own `eval()` output
 unchanged. Optical responses are first median-thresholded, then exposed in
-bipolar form. For `bit_aliasing`, each device/challenge/bit is majority-voted
-across `repetitions` before aggregation. Exact ties are resolved by independent
-50/50 draws from an RNG seeded with the report's `seed`, making the result
-reproducible for a fixed run configuration.
+bipolar form. For `uniformity`, `randomness`, and `bit_aliasing`, each
+device/challenge/bit is majority-voted across `repetitions` before aggregation.
+Exact ties are resolved by independent 50/50 draws from an RNG seeded with the
+report's `seed`, making the result reproducible for a fixed run configuration.
+`response_bits` is interpreted per family. FF-APUF generates wider outputs by
+sequentially evaluating independently seeded one-bit FF-APUF lanes on the same
+challenge. Saved baseline parameters record the effective width for each
+family as `effective_response_bits_by_family`.
 
 ```python
 from puf_sim.puf_baseline_eval import evaluate_exposed_metrics
@@ -145,6 +164,16 @@ The complete report includes `uniqueness`, `steadiness`, `reliability`,
 `probability_of_misidentification`, and all official comparison and Fourier
 metrics where their required inputs are available.
 
+`run_baseline_experiment()` saves the metric report by default. Pass
+`save_responses=False` to skip exporting per-instance, per-challenge, and
+per-repetition response CSV files while retaining the metric report.
+
+Set `backend="torch_xpu"` to use Intel XPU evaluation for PUFs that provide a
+backend evaluator. Response-normalization wrappers preserve that backend path,
+and supported PUFs use it while exporting response CSV data as well. PUFs
+without a backend evaluator and the official `pypuf.metrics` calls continue to
+use their CPU evaluation path, so a baseline run is not entirely GPU-resident.
+
 For SRAM, the baseline factory default uses `noisiness=0.01` and BCH
 code-offset correction capacity one. Set these options explicitly to compare
 ECC configurations:
@@ -165,9 +194,10 @@ print(results["sram"]["reliability"].mean())
 ```
 
 When `noisiness` is omitted, the baseline uses each family’s factory default
-(0.01 for SRAM, 0.0 for the other families). SRAM itself rejects noise values
-below 0.01. SRAM reports also include the aggregate `bch_total_reads` and
-`bch_uncorrectable_reads` counters for decoder diagnostics.
+(0.01 for SRAM, 0.0 for the other families). SRAM accepts explicit noise
+values from 0.0 to 1.0; setting it to zero disables read noise. SRAM reports
+also include the aggregate `bch_total_reads` and `bch_uncorrectable_reads`
+counters for decoder diagnostics.
 
 ## Command line
 

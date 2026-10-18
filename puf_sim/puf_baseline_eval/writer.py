@@ -125,7 +125,7 @@ def save_baseline_report(
                 filename = f"responses_{index}_{safe_family}.csv"
 
             with (report_directory / filename).open(
-                "w", newline="", encoding="utf-8"
+                "w", newline="", encoding="utf-8", buffering=1024 * 1024
             ) as handle:
                 writer = csv.writer(handle)
                 writer.writerow(
@@ -134,6 +134,27 @@ def save_baseline_report(
                         f"bit_{bit_index}"
                         for bit_index in range(first_values.shape[1])
                     ]
+                )
+                response_bits = first_values.shape[1]
+                if response_bits <= 16:
+                    bit_weights = 1 << np.arange(
+                        response_bits - 1, -1, -1, dtype=np.uint32
+                    )
+                    bit_row_lookup = np.asarray([
+                        ",".join(
+                            "1" if code & (1 << shift) else "0"
+                            for shift in range(response_bits - 1, -1, -1)
+                        )
+                        for code in range(1 << response_bits)
+                    ])
+                else:
+                    bit_weights = None
+                    bit_row_lookup = None
+                label_suffixes = tuple(
+                    f"sample {sample_index + 1}, "
+                    f"repetition {repetition_index + 1}"
+                    for sample_index in range(samples)
+                    for repetition_index in range(repetitions)
                 )
                 for instance_index, chunk in enumerate(
                     chain((first_values,), chunk_iterator), start=1
@@ -157,16 +178,31 @@ def save_baseline_report(
                             f"for instance {instance_index} of {family!r}, "
                             f"got {values.shape[0]}."
                         )
-                    for row_index, row in enumerate(values):
-                        sample_index, repetition_index = divmod(
-                            row_index, repetitions
-                        )
-                        label = (
-                            f"family {family}, instance {instance_index}, "
-                            f"sample {sample_index + 1}, "
-                            f"repetition {repetition_index + 1}"
-                        )
-                        writer.writerow([label, *row.tolist()])
+                    label_prefix = (
+                        f"family {family}, instance {instance_index}, "
+                    )
+                    if bit_row_lookup is None:
+                        for row_index, row in enumerate(values):
+                            label = (
+                                f"{label_prefix}{label_suffixes[row_index]}"
+                            )
+                            writer.writerow([label, *row.tolist()])
+                        continue
+
+                    bit_codes = values.astype(np.uint32, copy=False) @ bit_weights
+                    bit_rows = bit_row_lookup[bit_codes]
+                    for start in range(0, len(values), 8192):
+                        lines = []
+                        stop = min(start + 8192, len(values))
+                        for row_index in range(start, stop):
+                            label = (
+                                label_prefix + label_suffixes[row_index]
+                            )
+                            escaped_label = '"' + label.replace('"', '""') + '"'
+                            lines.append(
+                                f"{escaped_label},{bit_rows[row_index]}\r\n"
+                            )
+                        handle.write("".join(lines))
 
     return report_directory
 

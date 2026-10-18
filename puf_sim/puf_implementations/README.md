@@ -33,10 +33,14 @@ they are not substitutes for measurements from physical devices.
 The SRAM model enrolls a mismatch-derived fingerprint with a shortened binary
 BCH code-offset fuzzy extractor. Its public `helper_data` supports reproduction
 from later noisy reads; corrected fingerprint bits are XORed with the challenge
-and SHA-256 hashed as before. BCH correction capacity defaults to one bit and
-can be set to two when constructing an SRAM PUF. The simulated SRAM `noisiness`
-must be between `0.01` and `1.0`; omitting `noisiness` from `create_puf`
-selects `0.01` for SRAM and preserves the zero-noise default for other families.
+and SHA-256 hashed by default. Set `hash_responses=False` to return the direct
+challenge/fingerprint XOR bits instead, which is useful for comparing ML
+attacks against a learnable, unhashed response law. Unhashed responses can have
+at most `n` bits. BCH correction capacity defaults to one bit and can be set to
+two when constructing an SRAM PUF. The simulated SRAM `noisiness` must be
+between `0.0` and `1.0`; setting it to zero disables read noise.
+Omitting `noisiness` from `create_puf` selects `0.01` for SRAM and preserves
+the zero-noise default for other families.
 
 ```python
 sram = create_puf(
@@ -47,6 +51,15 @@ sram = create_puf(
     bch_correction_capacity=2,
 )
 public_helper_data = sram.helper_data
+
+unhashed_sram = create_puf(
+    "sram",
+    n=64,
+    response_bits=16,
+    seed=7,
+    noisiness=0.0,
+    hash_responses=False,
+)
 ```
 
 The helper data is public by design, but this analytical model does not provide
@@ -58,21 +71,27 @@ that out-of-capacity reads are observable.
 
 ## Python API
 
-Import the factory and create a 64-bit Arbiter PUF:
+Import the factory and Create a 64-bit Arbiter PUF with multiple independent output chains:
 
 ```python
 from puf_sim.puf_implementations import create_puf
 from pypuf.io import random_inputs
 
-puf = create_puf("arbiter", n=64, seed=7)
+puf = create_puf("arbiter", n=64, response_bits=3, seed=7)
 challenges = random_inputs(n=puf.challenge_length, N=10, seed=8)
 responses = puf.eval(challenges)
 
 print(responses.shape)
 ```
 
-Create an XOR Arbiter PUF with two response bits, an FF-APUF, and an Interpose
-PUF. For XOR Arbiter and Interpose PUFs, the lower/output stage chain count
+The resulting shape is `(10, 3)`. Each response column comes from an
+independent Arbiter chain; unlike an XOR Arbiter PUF, the chains are not XORed
+together.
+
+Create an XOR Arbiter PUF with two response bits, a multi-bit FF-APUF, and an
+Interpose PUF. Each FF-APUF response bit is generated sequentially by an
+independently seeded one-bit FF-APUF evaluated on the same challenge. For XOR
+Arbiter and Interpose PUFs, the lower/output stage chain count
 defaults to the challenge length `n` (64 chains here), or can be set with `k`.
 The implementation raises a smaller explicit `k` to at least `response_bits`,
 then partitions those chains into near-equal groups and combines each group in
@@ -93,6 +112,7 @@ ff_puf = create_puf(
     "ff_apuf",
     n=64,
     seed=2,
+    response_bits=3,
     ff=[(20, 40)],
 )
 interpose_puf = create_puf(
@@ -139,6 +159,10 @@ and gives each challenge position a distinct destination across the first `n`
 chains. If more than `n` chains are requested, further unique permutations are
 generated deterministically.
 
+FF-APUF `response_bits` defaults to one and preserves the original one-bit
+output shape. With a wider response, independently seeded FF-APUF lanes are
+evaluated sequentially on each challenge and their outputs are concatenated.
+
 Interpose PUF retains a single upper-stage bit that is inserted into the
 challenge, then uses its `k` lower-stage arbiter chains to produce output
 bits. The lower-stage chains are partitioned and balanced-XORed like XOR
@@ -146,8 +170,8 @@ Arbiter PUF chains; the upper stage remains one chain. `response_bits`
 defaults to one, preserving scalar output. For Interpose PUF, omitted `k`
 defaults the lower-stage count to `n`. `response_bits` also controls the
 response width of the analytical families and the number of optical response
-pixels. `noisiness` controls evaluation noise in supported models; SRAM
-requires at least `0.01`.
+pixels. `noisiness` controls evaluation noise in supported models; SRAM accepts
+values from `0.0` to `1.0`, with a default of `0.01` from `create_puf`.
 
 The native classes are also available directly:
 

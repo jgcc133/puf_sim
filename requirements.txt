@@ -5,6 +5,7 @@ xdoctest
 sphinx
 sphinx_rtd_theme
 scipy
+scikit-learn
 memory_profiler
 pytest
 tensorflow~=2.5.0

@@ -5,7 +5,11 @@ from typing import Any
 
 import numpy as np
 
-from ..common import AgentTrainer as _BaseAgentTrainer, TorchPUFModel
+from ..common import (
+    AgentTrainer as _BaseAgentTrainer,
+    TorchPUFModel,
+    _make_hidden_stack,
+)
 
 STAGE_NAME = "interpose_structure_aware"
 
@@ -39,30 +43,47 @@ class InterposeCore:
     """Learn the upstream Arbiter and downstream XOR delay weights."""
 
     def __new__(
-        cls, n: int, down_chain_count: int, interpose_pos: int, seed: int
+        cls,
+        n: int,
+        down_chain_count: int,
+        interpose_pos: int,
+        seed: int,
+        hidden_layers: int = 1,
+        width: int | None = None,
     ) -> Any:
         import torch
         from torch import nn
 
         torch.manual_seed(seed)
+        hidden_width = max(16, 2 * n) if width is None else width
 
         class _Module(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
-                self.up_weights = nn.Linear(n, 1)
-                self.down_weights = nn.Linear(n + 1, down_chain_count)
+                self.up_hidden, up_hidden_size = _make_hidden_stack(
+                    n, hidden_layers, hidden_width
+                )
+                self.down_hidden, down_hidden_size = _make_hidden_stack(
+                    n + 1, hidden_layers, hidden_width
+                )
+                self.up_weights = nn.Linear(up_hidden_size, 1)
+                self.down_weights = nn.Linear(down_hidden_size, down_chain_count)
                 self.interpose_pos = interpose_pos
 
             def forward(self, challenges: Any) -> Any:
                 up_features = _att_torch(challenges)
-                interpose_bit = _SignSTE.apply(self.up_weights(up_features))
+                interpose_bit = _SignSTE.apply(
+                    self.up_weights(self.up_hidden(up_features))
+                )
                 down_challenges = torch.cat((
                     challenges[:, :self.interpose_pos],
                     interpose_bit,
                     challenges[:, self.interpose_pos:],
                 ), dim=1)
                 down_features = _att_torch(down_challenges)
-                chain_logits = self.down_weights(down_features)
+                chain_logits = self.down_weights(
+                    self.down_hidden(down_features)
+                )
                 parity_score = torch.prod(torch.tanh(chain_logits), dim=1, keepdim=True)
                 return torch.tanh(parity_score)
 
@@ -92,7 +113,12 @@ class AgentTrainer:
         if device.type == "xpu":
             torch.xpu.manual_seed_all(seed)
         self.model = InterposeCore(
-            challenges.shape[1], down_chain_count, interpose_pos, seed
+            challenges.shape[1],
+            down_chain_count,
+            interpose_pos,
+            seed,
+            hidden_layers,
+            width,
         ).to(device)
         self.optimizer = torch.optim.Adam(
             self.model.parameters(), lr=learning_rate, foreach=False

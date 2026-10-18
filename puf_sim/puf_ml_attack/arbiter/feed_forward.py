@@ -5,7 +5,7 @@ from typing import Any
 
 import numpy as np
 
-from ..common import AgentTrainer as _BaseAgentTrainer
+from ..common import AgentTrainer as _BaseAgentTrainer, _make_hidden_stack
 
 STAGE_NAME = "ff_apuf_structure_aware"
 
@@ -38,11 +38,19 @@ class _SignSTE:
 class _FeedForwardCore:
     """Learn the two delay segments and internal sign-gated feed-forward loop."""
 
-    def __new__(cls, n: int, response_bits: int, seed: int) -> Any:
+    def __new__(
+        cls,
+        n: int,
+        response_bits: int,
+        seed: int,
+        hidden_layers: int = 1,
+        width: int | None = None,
+    ) -> Any:
         import torch
         from torch import nn
 
         torch.manual_seed(seed)
+        hidden_width = max(16, 2 * n) if width is None else width
         arbiter_point = max(1, min(n - 1, n // 3))
         feed_point = max(arbiter_point + 1, min(n - 1, (2 * n) // 3))
 
@@ -51,12 +59,22 @@ class _FeedForwardCore:
                 super().__init__()
                 self.arbiter_point = arbiter_point
                 self.feed_point = feed_point
-                self.weight_a = nn.Linear(arbiter_point, response_bits, bias=False)
-                self.weight_b = nn.Linear(n - arbiter_point + 1, response_bits, bias=False)
+                self.hidden_a, hidden_a_size = _make_hidden_stack(
+                    arbiter_point,
+                    hidden_layers,
+                    hidden_width,
+                )
+                self.hidden_b, hidden_b_size = _make_hidden_stack(
+                    n - arbiter_point + 1,
+                    hidden_layers,
+                    hidden_width,
+                )
+                self.weight_a = nn.Linear(hidden_a_size, response_bits, bias=False)
+                self.weight_b = nn.Linear(hidden_b_size, response_bits, bias=False)
 
             def forward(self, challenges: Any) -> Any:
                 segment_a = _att_torch(challenges[:, :self.arbiter_point])
-                delay_a = self.weight_a(segment_a)
+                delay_a = self.weight_a(self.hidden_a(segment_a))
                 virtual_bit = _SignSTE.apply(delay_a)
                 outputs = []
                 for bit_index in range(delay_a.shape[1]):
@@ -66,7 +84,8 @@ class _FeedForwardCore:
                         challenges[:, self.feed_point:],
                     ], dim=1)
                     gate = torch.prod(segment_b_raw, dim=1, keepdim=True)
-                    delay_b = self.weight_b(_att_torch(segment_b_raw))[:, bit_index:bit_index + 1]
+                    down_features = self.hidden_b(_att_torch(segment_b_raw))
+                    delay_b = self.weight_b(down_features)[:, bit_index:bit_index + 1]
                     outputs.append(delay_a[:, bit_index:bit_index + 1] * gate + delay_b)
                 return torch.cat(outputs, dim=1)
 
@@ -93,7 +112,9 @@ class AgentTrainer(_BaseAgentTrainer):
         torch.manual_seed(seed)
         if device.type == "xpu":
             torch.xpu.manual_seed_all(seed)
-        self.model = _FeedForwardCore(challenges.shape[1], response_bits, seed).to(device)
+        self.model = _FeedForwardCore(
+            challenges.shape[1], response_bits, seed, hidden_layers, width
+        ).to(device)
         self.optimizer = torch.optim.Adam(
             self.model.parameters(), lr=learning_rate, foreach=False
         )

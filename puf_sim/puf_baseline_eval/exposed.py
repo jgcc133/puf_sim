@@ -19,6 +19,8 @@ from pypuf.metrics import (
 )
 from pypuf.simulation import Simulation
 
+from puf_sim.puf_backend import Backend
+
 
 class NormalizedResponseSimulation(Simulation):
     """Wrap a continuous-response simulation to expose bipolar ``{-1, 1}`` responses.
@@ -51,6 +53,14 @@ class NormalizedResponseSimulation(Simulation):
         responses = np.asarray(self._instance.eval(challenges), dtype=float)
         return np.where(responses >= self._threshold, 1, -1).astype(np.int8)
 
+    def eval_backend(self, challenges: Any, backend: Backend) -> Any:
+        responses = backend.eval_array(self._instance, challenges)
+        threshold = backend.asarray(self._threshold, dtype=backend.xp.float32)
+        return backend.astype(
+            backend.xp.where(responses >= threshold, 1, -1),
+            backend.xp.int8,
+        )
+
 
 class BipolarResponseSimulation(Simulation):
     """Expose a simulation's discrete responses as bipolar values for metrics."""
@@ -70,6 +80,13 @@ class BipolarResponseSimulation(Simulation):
     def eval(self, challenges: np.ndarray) -> np.ndarray:
         responses = np.asarray(self._instance.eval(challenges))
         return np.where(responses > 0, 1, -1).astype(np.int8)
+
+    def eval_backend(self, challenges: Any, backend: Backend) -> Any:
+        responses = backend.eval_array(self._instance, challenges)
+        return backend.astype(
+            backend.xp.where(responses > 0, 1, -1),
+            backend.xp.int8,
+        )
 
 
 def normalize_to_bipolar(
@@ -92,6 +109,7 @@ def evaluate_exposed_api(
     samples: int = 1000,
     repetitions: int = 17,
     input_noise: float = 0.01,
+    precomputed_uniqueness: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Call every applicable metric exposed by ``pypuf.metrics``.
 
@@ -117,7 +135,9 @@ def evaluate_exposed_api(
     }
     if len(population) >= 2:
         result["uniqueness"] = np.asarray(
-            uniqueness(population, seed=seed + 2, N=samples)
+            precomputed_uniqueness
+            if precomputed_uniqueness is not None
+            else uniqueness(population, seed=seed + 2, N=samples)
         )
         result["similarity"] = np.asarray(
             similarity(population[0], population[1], seed=seed + 6, N=samples)

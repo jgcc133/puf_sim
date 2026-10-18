@@ -2,16 +2,26 @@ import numpy as np
 
 from pypuf.simulation import Simulation
 from puf_sim import evaluate_puf_population
+from puf_sim.puf_backend import Backend
+from puf_sim.puf_baseline_eval.exposed import (
+    BipolarResponseSimulation,
+    normalize_to_bipolar,
+)
 from puf_sim.puf_baseline_eval import report as baseline_report
 from puf_sim.puf_baseline_eval import (
     binary_entropy,
+    cross_challenge_randomness,
     evaluate_exposed_metrics,
     hamming_distance_distribution,
     majority_vote_repetitions,
     probability_of_misidentification,
     response_matrix,
+    uniqueness_from_responses,
 )
-from puf_sim.puf_baseline_eval.puf_test import _prepare_population_for_metrics
+from puf_sim.puf_baseline_eval.puf_test import (
+    _collect_population_responses,
+    _prepare_population_for_metrics,
+)
 
 
 class ConstantPUF(Simulation):
@@ -28,6 +38,92 @@ class ConstantPUF(Simulation):
 
     def eval(self, challenges: np.ndarray) -> np.ndarray:
         return np.full((len(challenges), 1), self.value, dtype=np.int8)
+
+
+class FakeXPUBackend(Backend):
+    def __init__(self) -> None:
+        super().__init__("torch_xpu", np)
+
+    def asarray(self, value, dtype=None):
+        return np.asarray(value, dtype=dtype)
+
+    def asnumpy(self, value):
+        return np.asarray(value)
+
+    def astype(self, value, dtype):
+        return np.asarray(value).astype(dtype)
+
+
+class BackendOnlyPUF(Simulation):
+    def __init__(self) -> None:
+        self.backend_evaluations = 0
+
+    @property
+    def challenge_length(self) -> int:
+        return 1
+
+    @property
+    def response_length(self) -> int:
+        return 1
+
+    def eval(self, challenges: np.ndarray) -> np.ndarray:
+        raise AssertionError("The CPU evaluation path should not be used.")
+
+    def eval_backend(self, challenges, backend):
+        self.backend_evaluations += 1
+        return backend.asarray(challenges[:, 0], dtype=backend.xp.int8)
+
+
+def test_bipolar_response_wrapper_forwards_backend_evaluation():
+    puf = BackendOnlyPUF()
+    backend = FakeXPUBackend()
+    challenges = np.array([[1], [0], [-1]], dtype=np.int8)
+
+    responses = backend.eval_array(BipolarResponseSimulation(puf), challenges)
+
+    np.testing.assert_array_equal(responses, [1, -1, -1])
+    assert puf.backend_evaluations == 1
+
+
+def test_normalized_response_wrapper_forwards_backend_evaluation():
+    class ContinuousBackendPUF(BackendOnlyPUF):
+        def eval(self, challenges: np.ndarray) -> np.ndarray:
+            return ((challenges[:, :1] + 1) / 2).astype(float)
+
+        def eval_backend(self, challenges, backend):
+            self.backend_evaluations += 1
+            values = backend.asarray(challenges[:, :1], dtype=backend.xp.float32)
+            return (values + 1) / 2
+
+    puf = ContinuousBackendPUF()
+    wrapped = normalize_to_bipolar(puf, seed=10, calibration_samples=8)
+    backend = FakeXPUBackend()
+    challenges = np.array([[-1], [1]], dtype=np.int8)
+
+    responses = backend.eval_array(wrapped, challenges)
+
+    np.testing.assert_array_equal(
+        responses,
+        wrapped.eval(challenges),
+    )
+    assert puf.backend_evaluations == 1
+
+
+def test_response_collection_uses_backend_for_supported_pufs():
+    puf = BackendOnlyPUF()
+    responses = next(
+        _collect_population_responses(
+            [puf],
+            samples=3,
+            repetitions=2,
+            seed=5,
+            backend=FakeXPUBackend(),
+        )
+    )
+
+    assert responses.shape == (6, 1)
+    assert set(np.unique(responses)).issubset({0, 1})
+    assert puf.backend_evaluations == 1
 
 
 def test_response_data_helpers():
@@ -89,6 +185,125 @@ def test_baseline_bit_aliasing_uses_majority_votes_across_repetitions(monkeypatc
     )
 
     np.testing.assert_array_equal(result["bit_aliasing"], [expected_tie_vote])
+    assert result["uniformity"] == expected_tie_vote
+
+
+def test_cross_challenge_randomness_scores_uncorrelated_challenges_as_one():
+    responses = np.array([
+        [[-1], [-1]],
+        [[-1], [1]],
+        [[1], [-1]],
+        [[1], [1]],
+    ])
+
+    assert cross_challenge_randomness(responses) == 1.0
+
+
+def test_cross_challenge_randomness_scores_correlated_challenges_as_zero():
+    responses = np.array([
+        [[-1], [-1]],
+        [[-1], [-1]],
+        [[1], [1]],
+        [[1], [1]],
+    ])
+
+    assert cross_challenge_randomness(responses) == 0.0
+
+
+def test_cross_challenge_randomness_returns_zero_without_variable_pairs():
+    constant_responses = np.ones((3, 2, 1), dtype=np.int8)
+    one_challenge = np.array([[[-1]], [[1]]])
+
+    assert cross_challenge_randomness(constant_responses) == 0.0
+    assert cross_challenge_randomness(one_challenge) == 0.0
+
+
+def test_uniqueness_from_responses_matches_pypuf_metric():
+    from pypuf.metrics import uniqueness_data
+
+    responses = np.array([
+        [[-1], [-1], [1]],
+        [[-1], [1], [1]],
+        [[1], [-1], [1]],
+    ])
+
+    np.testing.assert_allclose(
+        uniqueness_from_responses(responses),
+        uniqueness_data(responses),
+    )
+
+
+def test_report_scores_uniformity_and_randomness_after_majority_vote(monkeypatch):
+    class NoisyTablePUF(ConstantPUF):
+        def __init__(self, responses):
+            super().__init__(1)
+            self.responses = np.asarray(responses, dtype=np.int8)
+            self.evaluations = 0
+
+        def eval(self, challenges: np.ndarray) -> np.ndarray:
+            evaluation = self.evaluations
+            self.evaluations += 1
+            responses = self.responses
+            if evaluation == 2:
+                responses = -responses
+            return responses.reshape(len(challenges), 1)
+
+    monkeypatch.setattr(
+        baseline_report,
+        "evaluate_exposed_api",
+        lambda *args, **kwargs: {
+            "bias": np.array([0.0]),
+            "reliability": np.ones((2, 1)),
+            "total_influence": 0.0,
+        },
+    )
+    population = [
+        NoisyTablePUF([-1, -1]),
+        NoisyTablePUF([-1, 1]),
+        NoisyTablePUF([1, -1]),
+        NoisyTablePUF([1, 1]),
+    ]
+
+    result = evaluate_exposed_metrics(
+        population[0],
+        instances=population,
+        samples=2,
+        repetitions=3,
+        seed=10,
+    )
+
+    assert result["uniformity"] == 0.5
+    assert result["randomness"] == 1.0
+
+
+def test_report_majority_votes_one_dimensional_single_bit_responses(monkeypatch):
+    class OneDimensionalPUF(Simulation):
+        @property
+        def challenge_length(self) -> int:
+            return 4
+
+        @property
+        def response_length(self) -> int:
+            return 1
+
+        def eval(self, challenges: np.ndarray) -> np.ndarray:
+            return np.where(challenges[:, 0] > 0, 1, -1).astype(np.int8)
+
+    monkeypatch.setattr(
+        baseline_report,
+        "evaluate_exposed_api",
+        lambda *args, **kwargs: {
+            "bias": np.array([0.0]),
+            "reliability": np.ones((4, 1)),
+            "total_influence": 0.0,
+        },
+    )
+    puf = OneDimensionalPUF()
+
+    result = evaluate_exposed_metrics(puf, samples=4, repetitions=3, seed=10)
+
+    assert result["bit_aliasing"].shape == (1,)
+    assert 0.0 <= result["uniformity"] <= 1.0
 
 
 def test_baseline_report_rounds_diffuseness_for_reporting(monkeypatch):

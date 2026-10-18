@@ -7,7 +7,6 @@ import numpy as np
 
 from puf_sim.puf_backend import Backend
 from pypuf.simulation import (
-    ArbiterPUF as _ArbiterPUF,
     FeedForwardArbiterPUF as _FeedForwardArbiterPUF,
     IntegratedOpticalPUF as _IntegratedOpticalPUF,
     InterposePUF as _InterposePUF,
@@ -18,7 +17,12 @@ from pypuf.simulation import (
 
 def _att_backend(challenges: Any, xp: Any) -> Any:
     """Apply the arbiter threshold transform to ``(N, k, n)`` tensors."""
-    return xp.flip(xp.cumprod(xp.flip(challenges, dims=(2,)), dim=2), dims=(2,))
+    prefix_products = xp.cumprod(challenges, dim=2)
+    exclusive_prefix = xp.cat(
+        (xp.ones_like(challenges[..., :1]), prefix_products[..., :-1]),
+        dim=2,
+    )
+    return xp.prod(challenges, dim=2, keepdim=True) * exclusive_prefix
 
 
 def _noise_backend(instance: Any, backend: Backend, shape: tuple[int, ...], sigma: float) -> Any:
@@ -152,51 +156,190 @@ class XORArbiterPUF(_XORBackendMixin, _XORArbiterPUF):
         return responses[:, 0] if self.response_bits == 1 else responses
 
 
-class ArbiterPUF(_XORBackendMixin, _ArbiterPUF):
-    pass
+class ArbiterPUF(_XORBackendMixin, _XORArbiterPUF):
+    """Arbiter PUF with independently evaluated output chains."""
+
+    def __init__(
+        self,
+        n: int,
+        seed: int | None = None,
+        transform: Any = None,
+        noisiness: float = 0.0,
+        response_bits: int = 1,
+    ) -> None:
+        if (
+            isinstance(response_bits, bool)
+            or not isinstance(response_bits, (int, np.integer))
+            or response_bits < 1
+        ):
+            raise ValueError("response_bits must be a positive integer.")
+        self.response_bits = int(response_bits)
+        super().__init__(
+            n=n,
+            k=self.response_bits,
+            seed=seed,
+            transform=transform,
+            noisiness=noisiness,
+        )
+
+    @property
+    def response_length(self) -> int:
+        return self.response_bits
+
+    def _combine_chain_responses(
+        self, chain_responses: Any, backend: Backend | None = None
+    ) -> Any:
+        if self.response_bits == 1:
+            return chain_responses[:, 0]
+        return chain_responses
+
+    def val(self, challenges: np.ndarray) -> np.ndarray:
+        sub_challenges = self.transform(challenges, self.k)
+        chain_values = self.ltf_eval(sub_challenges)
+        return self._combine_chain_responses(np.sign(chain_values))
+
+    def eval(self, challenges: np.ndarray, block_size: int | None = 10**6) -> np.ndarray:
+        count = challenges.shape[0]
+        if count == 0:
+            shape = (0,) if self.response_bits == 1 else (0, self.response_bits)
+            return np.empty(shape, dtype=challenges.dtype)
+
+        block_size = block_size or count
+        responses = np.empty((count, self.response_bits), dtype=challenges.dtype)
+        for start in range(0, count, block_size):
+            stop = min(start + block_size, count)
+            responses[start:stop] = self.eval_block(challenges[start:stop]).reshape(
+                stop - start, self.response_bits
+            )
+        return responses[:, 0] if self.response_bits == 1 else responses
+
+
+def _feed_forward_eval_backend(
+    puf: _FeedForwardArbiterPUF,
+    challenges: Any,
+    backend: Backend,
+) -> Any:
+    xp = backend.xp
+    challenges = backend.asarray(challenges, dtype=xp.float32)
+    count = challenges.shape[0]
+    loops = sorted(puf.ff, key=lambda loop: loop[0])
+    feed_points = {feed_point for _, feed_point in loops}
+    ff_challenges = xp.zeros(
+        (count, puf.n + len(loops)),
+        dtype=xp.float32,
+        device=challenges.device,
+    )
+    offset = 0
+    for index in range(puf.n + len(loops)):
+        if index in feed_points:
+            offset += 1
+        else:
+            ff_challenges[:, index] = challenges[:, index - offset]
+
+    delay_difference = xp.zeros((count,), dtype=xp.float32, device=challenges.device)
+    delay_difference_pos = 0
+    for arbiter_point, feed_point in loops + [(puf.n + len(loops), None)]:
+        section = ff_challenges[:, delay_difference_pos:arbiter_point]
+        transformed = _att_backend(section[:, None, :], xp)[:, 0, :]
+        weights = backend.asarray(
+            puf.weight_array[:, delay_difference_pos:arbiter_point],
+            dtype=xp.float32,
+        )
+        section_value = xp.sum(transformed * weights, dim=1)
+        section_noise = np.random.default_rng(
+            puf.noise_prng.integers(2**32)
+        ).normal(
+            loc=0,
+            scale=puf.sigma_noise_from_random_weights(
+                n=(arbiter_point or puf.n) - delay_difference_pos,
+                sigma_weight=1,
+                noisiness=puf.noisiness,
+            ),
+            size=(count,),
+        )
+        section_value = section_value + backend.asarray(section_noise, dtype=xp.float32)
+        delay_difference = delay_difference * xp.prod(section, dim=1) + section_value
+        delay_difference_pos = arbiter_point
+        if feed_point:
+            ff_challenges[:, feed_point] = xp.sign(delay_difference)
+
+    return backend.astype(xp.sign(delay_difference), xp.int8)
 
 
 class FeedForwardArbiterPUF(_FeedForwardArbiterPUF):
-    def eval_backend(self, challenges: Any, backend: Backend) -> Any:
-        xp = backend.xp
-        challenges = backend.asarray(challenges, dtype=xp.float32)
-        count = challenges.shape[0]
-        loops = sorted(self.ff, key=lambda loop: loop[0])
-        feed_points = {feed_point for _, feed_point in loops}
-        ff_challenges = xp.zeros((count, self.n + len(loops)), dtype=xp.float32, device=challenges.device)
-        offset = 0
-        for index in range(self.n + len(loops)):
-            if index in feed_points:
-                offset += 1
-            else:
-                ff_challenges[:, index] = challenges[:, index - offset]
+    def __init__(
+        self,
+        n: int,
+        ff: list[tuple[int, int]],
+        seed: int | None = None,
+        noisiness: float = 0.0,
+        response_bits: int = 1,
+    ) -> None:
+        if (
+            isinstance(response_bits, bool)
+            or not isinstance(response_bits, (int, np.integer))
+            or response_bits < 1
+        ):
+            raise ValueError("response_bits must be a positive integer.")
 
-        delay_difference = xp.zeros((count,), dtype=xp.float32, device=challenges.device)
-        delay_difference_pos = 0
-        for arbiter_point, feed_point in loops + [(self.n + len(loops), None)]:
-            section = ff_challenges[:, delay_difference_pos:arbiter_point]
-            transformed = _att_backend(section[:, None, :], xp)[:, 0, :]
-            weights = backend.asarray(
-                self.weight_array[:, delay_difference_pos:arbiter_point],
-                dtype=xp.float32,
-            )
-            section_value = xp.sum(transformed * weights, dim=1)
-            section_noise = np.random.default_rng(self.noise_prng.integers(2**32)).normal(
-                loc=0,
-                scale=self.sigma_noise_from_random_weights(
-                    n=(arbiter_point or self.n) - delay_difference_pos,
-                    sigma_weight=1,
-                    noisiness=self.noisiness,
+        loops = list(ff)
+        self.response_bits = int(response_bits)
+        super().__init__(n=n, ff=loops, seed=seed, noisiness=noisiness)
+        self._additional_lanes = [
+            _FeedForwardArbiterPUF(
+                n=n,
+                ff=list(loops),
+                seed=self.seed(
+                    "FeedForwardArbiterPUF response bit "
+                    f"{bit_index} seed {seed if seed is not None else 'default'}"
                 ),
-                size=(count,),
+                noisiness=noisiness,
             )
-            section_value = section_value + backend.asarray(section_noise, dtype=xp.float32)
-            delay_difference = delay_difference * xp.prod(section, dim=1) + section_value
-            delay_difference_pos = arbiter_point
-            if feed_point:
-                ff_challenges[:, feed_point] = xp.sign(delay_difference)
+            for bit_index in range(1, self.response_bits)
+        ]
 
-        return backend.astype(xp.sign(delay_difference), xp.int8)
+    @property
+    def response_length(self) -> int:
+        return self.response_bits
+
+    def _lanes(self) -> list[_FeedForwardArbiterPUF]:
+        return [self, *self._additional_lanes]
+
+    def val(self, challenges: np.ndarray) -> np.ndarray:
+        values = [
+            _FeedForwardArbiterPUF.val(lane, challenges)
+            for lane in self._lanes()
+        ]
+        if self.response_bits == 1:
+            return values[0]
+        return np.column_stack(values)
+
+    def eval(
+        self,
+        challenges: np.ndarray,
+        block_size: int | None = 10**6,
+    ) -> np.ndarray:
+        count = challenges.shape[0]
+        if count == 0:
+            shape = (0,) if self.response_bits == 1 else (0, self.response_bits)
+            return np.empty(shape, dtype=challenges.dtype)
+
+        block_size = block_size or count
+        responses = []
+        for start in range(0, count, block_size):
+            stop = min(start + block_size, count)
+            responses.append(np.sign(self.val(challenges[start:stop])))
+        result = np.concatenate(responses, axis=0)
+        return result if self.response_bits > 1 else result.reshape(-1)
+
+    def eval_backend(self, challenges: Any, backend: Backend) -> Any:
+        responses = [
+            _feed_forward_eval_backend(lane, challenges, backend)
+            for lane in self._lanes()
+        ]
+        if self.response_bits == 1:
+            return responses[0]
+        return backend.xp.stack(responses, dim=1)
 
 
 class PermutationPUF(_XORBackendMixin, _PermutationPUF):

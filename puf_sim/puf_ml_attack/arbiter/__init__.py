@@ -15,7 +15,7 @@ STAGE_NAME = "arbiter_mlp_ensemble"
 
 def feature_map(challenges: np.ndarray) -> np.ndarray:
     """Apply the Arbiter Threshold Transform used by pypuf's ArbiterPUF."""
-    return ArbiterPUF.transform_atf(np.asarray(challenges), 1)[:, 0, :]
+    return ArbiterPUF.transform_atf(np.asarray(challenges), 1)[:, 0, :].copy()
 
 
 class AgentTrainer(_BaseAgentTrainer):

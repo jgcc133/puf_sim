@@ -11,7 +11,11 @@ from pypuf.io import ChallengeResponseSet, random_inputs
 from pypuf.simulation import Simulation
 
 from puf_sim.puf_implementations import create_puf
-from puf_sim.puf_implementations.analytical import StaticRandomAccessMemoryPUF
+from puf_sim.puf_backend import Backend, get_backend
+from puf_sim.puf_implementations.analytical import (
+    SiliconPhotonicPUF,
+    StaticRandomAccessMemoryPUF,
+)
 from .exposed import BipolarResponseSimulation, normalize_to_bipolar
 from .report import evaluate_exposed_metrics
 from .writer import save_baseline_report
@@ -36,6 +40,10 @@ def _effective_noisiness(family: str, noisiness: Optional[float]) -> float:
         return noisiness
     family_key = family.strip().lower().replace("-", "_").replace(" ", "_")
     return 0.01 if family_key in {"sram", "static_random_access_memory"} else 0.0
+
+
+def _effective_response_bits(family: str, response_bits: int) -> int:
+    return response_bits
 
 
 def _prepare_population_for_metrics(
@@ -65,6 +73,8 @@ def _collect_population_responses(
     samples: int,
     repetitions: int,
     seed: int,
+    backend: Optional[Backend] = None,
+    batch_size: Optional[int] = None,
 ) -> Iterator[np.ndarray]:
     """Yield binary response matrices by instance, avoiding a population-wide copy."""
     challenge_length = population[0].challenge_length
@@ -76,6 +86,79 @@ def _collect_population_responses(
             or puf.response_length != response_length
         ):
             raise ValueError("All PUF instances must have matching dimensions.")
+    if backend is not None and all(
+        isinstance(puf, SiliconPhotonicPUF) for puf in population
+    ):
+        step = batch_size or len(population)
+        for start in range(0, len(population), step):
+            batch = population[start:start + step]
+            repeated_responses = backend.asnumpy(
+                backend.xp.stack(
+                    [
+                        SiliconPhotonicPUF.eval_population_backend(
+                            batch,
+                            challenges,
+                            backend,
+                            batch_size=step,
+                        )
+                        for _ in range(repetitions)
+                    ],
+                    dim=-1,
+                )
+            )
+            expected_shape = (
+                len(batch),
+                samples,
+                response_length,
+                repetitions,
+            )
+            if repeated_responses.shape != expected_shape:
+                raise ValueError(
+                    f"Expected repeated responses with shape {expected_shape}, "
+                    f"got {repeated_responses.shape}."
+                )
+            for device_index in range(len(batch)):
+                yield (
+                    (repeated_responses[device_index].transpose(0, 2, 1) > 0)
+                    .astype(np.uint8)
+                    .reshape(samples * repetitions, response_length)
+                )
+        return
+
+    if backend is not None and all(
+        callable(getattr(puf, "eval_backend", None)) for puf in population
+    ):
+        repeated_challenges = np.tile(challenges, (repetitions, 1))
+        expected_shape = (samples * repetitions, response_length)
+        for puf in population:
+            repeated_responses = backend.asnumpy(
+                backend.eval_array(puf, repeated_challenges)
+            )
+            if repeated_responses.ndim == 1 and response_length == 1:
+                repeated_responses = repeated_responses.reshape(-1, 1)
+            if tuple(repeated_responses.shape) != expected_shape:
+                raise ValueError(
+                    "Backend response batches must have shape "
+                    f"{expected_shape}, got {tuple(repeated_responses.shape)}."
+                )
+            repeated_responses = repeated_responses.reshape(
+                repetitions, samples, response_length
+            ).transpose(1, 2, 0)
+            expected_repeated_shape = (samples, response_length, repetitions)
+            if repeated_responses.shape != expected_repeated_shape:
+                raise ValueError(
+                    "Repeated backend responses must have shape "
+                    f"{expected_repeated_shape}, got "
+                    f"{tuple(repeated_responses.shape)}."
+                )
+            yield (
+                (repeated_responses.transpose(0, 2, 1) > 0)
+                .astype(np.uint8)
+                .reshape(samples * repetitions, response_length)
+            )
+        return
+
+    for puf in population:
         repeated_responses = np.asarray(puf.r_eval(repetitions, challenges))
         expected_shape = (samples, response_length, repetitions)
         if repeated_responses.shape != expected_shape:
@@ -118,13 +201,14 @@ def _evaluate_family(
             if family_key in {"xor_arbiter", "xor_apuf", "interpose", "permutation"}
             else 2
         )
+    effective_response_bits = _effective_response_bits(family, response_bits)
     population = [
         create_puf(
             family,
             n=n,
             seed=seed + family_index * instances_per_family + device_index,
             k=effective_k,
-            response_bits=response_bits,
+            response_bits=effective_response_bits,
             noisiness=_effective_noisiness(family, noisiness),
             bch_correction_capacity=bch_correction_capacity,
         )
@@ -147,12 +231,19 @@ def _evaluate_family(
         device=device,
         batch_size=batch_size,
     )
+    response_backend = None
+    if save_responses and callable(getattr(population[0], "eval_backend", None)):
+        selected_backend = get_backend(backend, device=device)
+        if selected_backend.name == "torch_xpu":
+            response_backend = selected_backend
     response_rows = (
         _collect_population_responses(
             population,
             samples=samples,
             repetitions=repetitions,
             seed=seed + family_index,
+            backend=response_backend,
+            batch_size=batch_size,
         )
         if save_responses
         else None
@@ -201,6 +292,7 @@ def run_baseline_experiment(
     device: Optional[int] = None,
     batch_size: Optional[int] = None,
     bch_correction_capacity: int = 1,
+    save_responses: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     """Evaluate the baseline metrics for a population of each PUF family.
 
@@ -236,7 +328,7 @@ def run_baseline_experiment(
             device,
             batch_size,
             bch_correction_capacity,
-            save_report,
+            save_responses and save_report,
         )
         for family_index, family in enumerate(selected_families)
     ]
@@ -257,12 +349,17 @@ def run_baseline_experiment(
             "seed": seed,
             "k": k,
             "response_bits": response_bits,
+            "effective_response_bits_by_family": {
+                family: _effective_response_bits(family, response_bits)
+                for family in selected_families
+            },
             "noisiness": noisiness,
             "effective_noisiness_by_family": {
                 family: _effective_noisiness(family, noisiness)
                 for family in selected_families
             },
             "bch_correction_capacity": bch_correction_capacity,
+            "save_responses": save_responses,
             "workers": max_workers,
             "backend": backend,
             "device": device,

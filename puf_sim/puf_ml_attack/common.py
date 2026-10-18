@@ -14,6 +14,20 @@ from pypuf.io import ChallengeResponseSet
 from pypuf.simulation import Simulation
 
 
+def _make_hidden_stack(
+    input_size: int, hidden_layers: int, width: int
+) -> tuple[Any, int]:
+    if hidden_layers < 0 or (hidden_layers > 0 and width < 1):
+        raise ValueError("hidden_layers must be nonnegative and width must be positive.")
+    from torch import nn
+
+    layers: list[Any] = []
+    for _ in range(hidden_layers):
+        layers.extend([nn.Linear(input_size, width), nn.Tanh()])
+        input_size = width
+    return nn.Sequential(*layers), input_size
+
+
 class TorchPUFModel(Simulation):
     """Adapt one or more PyTorch classifiers to pypuf's simulation interface."""
 

@@ -7,7 +7,8 @@ The package is organized into two submodules:
 
 - `puf_sim.puf_implementations`: native `pypuf` PUFs and analytical models for
   the requested PUF families.
-  baseline metrics such as uniformity, entropy-based randomness, bit aliasing,
+  baseline metrics such as uniformity, cross-challenge correlation randomness,
+  bit aliasing,
   diffuseness, Hamming-distance distributions, and probability of
   misidentification.
  `puf_sim.puf_backend`: optional NumPy/Intel XPU backend selection. Native
@@ -100,11 +101,14 @@ summarized using the baseline criteria:
 - similarity, bias, influence, total influence, and noise sensitivity when
   applicable
 
-The `randomness` score is the mean normalized entropy of the 0/1 balance
-within each complete response string, averaged across all device/challenge
-responses. It is distinct from `bit_aliasing`, which measures the skew at each
-response-bit position across the population. A one-bit response has zero
-within-response entropy by definition.
+`uniformity` is the scalar mean fraction of majority-voted `1` responses across
+challenge-level population responses and output bits; `0.5` is balanced.
+`randomness` is
+`1 - mean(abs(Pearson correlation))` across distinct challenge pairs, where
+each pair's per-bit response vectors are correlated across PUF instances.
+Repetitions are majority-voted per device/challenge/bit before either metric
+is calculated. `binary_entropy` remains available as a separate helper for
+within-response entropy.
 
 The complete report is returned as a dictionary:
 
@@ -190,6 +194,10 @@ results = run_baseline_experiment(
 )
 ```
 
+Use `save_responses=False` to retain the metrics report without writing the
+per-instance, per-challenge, per-repetition response CSV files. This can
+substantially reduce report-export time and disk usage for large runs.
+
 `parameters.json` stores the complete configuration, `results.json` stores
 the complete metric arrays, and `summary.csv` provides one spreadsheet-friendly
 row per family.
@@ -201,7 +209,7 @@ families, using 100 independently seeded instances per family and four
 parallel family workers. It prints the main baseline metrics for each family:
 
 ```powershell
-& ".\puf_env\Scripts\python.exe" -c "from puf_sim.puf_baseline_eval import run_baseline_experiment; results=run_baseline_experiment(instances_per_family=100, n=64, samples=1000, repetitions=17, seed=20260921, workers=4); [print(f'{family}: uniqueness={report[\"uniqueness\"].mean():.4f} steadiness={report[\"steadiness\"].mean():.4f} reliability={report[\"reliability\"].mean():.4f} uniformity={report[\"uniformity\"]:.4f} randomness={report[\"randomness\"]:.4f} bit_aliasing={report[\"bit_aliasing\"]:.4f} diffuseness={report[\"diffuseness\"]:.4f} misidentification={report[\"probability_of_misidentification\"]:.6f}') for family, report in results.items()]"
+& ".\puf_env\Scripts\python.exe" -c "from puf_sim.puf_baseline_eval import run_baseline_experiment; results=run_baseline_experiment(instances_per_family=100, n=64, samples=1000, repetitions=17, seed=20260921, workers=4); [print(f'{family}: uniqueness={report[\"uniqueness\"].mean():.4f} steadiness={report[\"steadiness\"].mean():.4f} reliability={report[\"reliability\"].mean():.4f} uniformity={report[\"uniformity\"]:.4f} randomness={report[\"randomness\"]:.4f} bit_aliasing={report[\"bit_aliasing\"].tolist()} diffuseness={report[\"diffuseness\"]:.4f} misidentification={report[\"probability_of_misidentification\"]:.6f}') for family, report in results.items()]"
 ```
 
 For a quicker smoke run, reduce the challenge sample count and repeated
@@ -316,11 +324,13 @@ been collected:
 from puf_sim.puf_baseline_eval import (
     binary_entropy,
     bit_aliasing,
+    cross_challenge_randomness,
     hamming_distance_distribution,
     probability_of_misidentification,
 )
 
-randomness = binary_entropy(responses)
+entropy = binary_entropy(responses)
+randomness = cross_challenge_randomness(voted_population_responses)
 aliasing = bit_aliasing(population_responses)
 distances = hamming_distance_distribution(responses)
 misidentification = probability_of_misidentification(population_responses)

@@ -108,6 +108,94 @@ def bit_aliasing(responses: np.ndarray, backend: Backend | None = None) -> np.nd
     return backend.asnumpy(probability_one)
 
 
+def cross_challenge_randomness(
+    responses: np.ndarray,
+    backend: Backend | None = None,
+) -> float:
+    """Score low correlation across distinct challenges as high randomness.
+
+    ``responses`` has shape ``(devices, challenges, response_bits)`` and must
+    contain majority-voted responses. For each output bit, Pearson
+    correlations are calculated across devices for every distinct challenge
+    pair. The score is ``1 - mean(abs(correlation))`` over pairs where both
+    challenge response vectors vary across devices. If no such pairs exist,
+    the score is zero because the responses provide no evidence of
+    cross-challenge independence.
+    """
+    backend = backend or get_backend("numpy")
+    xp = backend.xp
+    values = backend.asarray(responses)
+    if values.ndim != 3:
+        raise ValueError(
+            "Cross-challenge randomness expects "
+            "(devices, challenges, response_bits)."
+        )
+    if any(dimension < 1 for dimension in values.shape):
+        raise ValueError("Responses must contain devices, challenges, and bits.")
+
+    values = backend.astype(xp.where(values > 0, 1, -1), xp.float32)
+    challenge_count = values.shape[1]
+    upper_triangle = backend.asarray(
+        np.triu(np.ones((challenge_count, challenge_count), dtype=np.float32), k=1)
+    ) > 0
+    absolute_correlation_sum = 0.0
+    valid_pair_count = 0
+
+    for bit_index in range(values.shape[2]):
+        bit_responses = values[:, :, bit_index]
+        centered = bit_responses - xp.mean(bit_responses, axis=0, keepdims=True)
+        covariance = centered.T @ centered
+        sums_of_squares = xp.sum(centered * centered, axis=0)
+        denominator = xp.sqrt(
+            sums_of_squares[:, None] * sums_of_squares[None, :]
+        )
+        valid_pairs = upper_triangle & (denominator > 0)
+        safe_denominator = xp.where(valid_pairs, denominator, 1.0)
+        correlations = covariance / safe_denominator
+        absolute_correlation_sum += float(backend.asnumpy(
+            xp.sum(xp.where(valid_pairs, xp.abs(correlations), 0.0))
+        ))
+        valid_pair_count += int(backend.asnumpy(xp.sum(
+            backend.astype(valid_pairs, xp.int64)
+        )))
+
+    if valid_pair_count == 0:
+        return 0.0
+    return float(np.clip(1.0 - absolute_correlation_sum / valid_pair_count, 0.0, 1.0))
+
+
+def uniqueness_from_responses(
+    responses: np.ndarray,
+    backend: Backend | None = None,
+) -> np.ndarray:
+    """Compute pypuf-style uniqueness from ``(devices, challenges, bits)`` responses."""
+    backend = backend or get_backend("numpy")
+    xp = backend.xp
+    values = backend.asarray(responses)
+    if values.ndim != 3:
+        raise ValueError("Uniqueness expects (devices, challenges, response_bits).")
+    if values.shape[0] < 2 or values.shape[1] < 1 or values.shape[2] < 1:
+        raise ValueError("Uniqueness requires at least two devices and non-empty responses.")
+
+    device_count, challenge_count, response_bits = values.shape
+    pair_count = device_count * (device_count - 1) // 2
+    upper_triangle = backend.asarray(
+        np.triu(np.ones((device_count, device_count), dtype=np.float32), k=1)
+    ) > 0
+    values = backend.astype(xp.where(values > 0, 1, -1), xp.float32)
+    uniqueness = []
+    for bit_index in range(response_bits):
+        bit_values = values[:, :, bit_index]
+        similarities = (
+            (bit_values @ bit_values.T) / challenge_count + 1.0
+        ) * 0.5
+        mean_absolute_bias = xp.sum(
+            xp.where(upper_triangle, xp.abs(0.5 - similarities), 0.0)
+        ) / pair_count
+        uniqueness.append(1.0 - 2.0 * mean_absolute_bias)
+    return backend.asnumpy(xp.stack(uniqueness))
+
+
 def majority_vote_repetitions(
     responses: np.ndarray,
     rng: np.random.Generator,
@@ -152,8 +240,10 @@ def probability_of_misidentification(responses: np.ndarray, backend: Backend | N
 __all__ = [
     "binary_entropy",
     "bit_aliasing",
+    "cross_challenge_randomness",
     "hamming_distance_distribution",
     "majority_vote_repetitions",
     "probability_of_misidentification",
     "response_matrix",
+    "uniqueness_from_responses",
 ]
