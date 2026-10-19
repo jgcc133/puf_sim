@@ -10,6 +10,42 @@ When `families=None`, the experiment attacks `optical`, `arbiter`, `ff_apuf`,
 `xor_apuf`, `interpose`, `permutation`, `ring_oscillator`, `sram`,
 `memristive`, and `silicon_photonic`.
 
+## Model catalog and routing
+
+The experiment supports four top-level `attack_model` values:
+
+- `"auto"`: family-aware default routing.
+- `"neural"`: family-routed neural path (non-optical families).
+- `"svm"`: SVM route for supported non-optical families.
+- `"deep_neural"`: structure-aware PyTorch DNN for `ff_apuf`, `xor_apuf`,
+  `interpose`, and `permutation`.
+
+With `attack_model="auto"`, routing is:
+
+| Family | Auto-selected attack | Other practical options |
+| --- | --- | --- |
+| `arbiter` | ATT + scikit-learn logistic regression | `neural`, `svm` |
+| `ff_apuf` | Structure-aware deep neural FF model | `deep_neural`, `neural`, `svm` |
+| `xor_apuf` | Chain-aware route: logistic (1 chain/bit), rank-two (2 chains/bit), parity neural (larger) | `deep_neural`, `neural`, `svm` |
+| `interpose` | Structure-aware linear/logistic model of the up/down stages | `deep_neural`, `neural`, `svm`, `staged_split` |
+| `permutation` | Structure-aware permutation parity attack | `deep_neural`, `neural`, `svm` |
+| `optical` | Structure-aware rank-two quadratic regression | (always optical-specific route) |
+| `ring_oscillator` | Logistic regression on raw challenge features | `neural`, `svm` |
+| `sram` | Hash brute-force (`hash_responses=True`) or direct logistic (`False`) | `neural`, `svm` |
+| `memristive` | Linear classifier route | `neural`, `svm` |
+| `silicon_photonic` | Shared nonlinear classifier route | `neural`, `svm` |
+
+Notes:
+
+- For `xor_apuf`, route details depend on effective chains per response bit.
+- For `deep_neural` FF training, per-bit threshold calibration is enabled to
+  reduce row-level single-bit mismatches. All supported deep-neural families
+  reduce the learning rate by half after eight epochs without a meaningful
+  validation-EMA improvement, down to a floor of `1e-4`. The permutation
+  parity attack uses the same adaptive learning-rate policy. Their stage
+  reports record each epoch's validation scores, EMA, learning rates, and LR
+  events.
+
 ## Training and success criteria
 
 For each instance, the experiment selects an attack from the supplied PUF
@@ -20,17 +56,22 @@ With the default `attack_model="auto"`, family routing is:
 
 - Arbiter PUF: scikit-learn logistic regression on the Arbiter Threshold
   Transform (ATT) challenge features.
-- Feed-forward Arbiter PUF: a feed-forward-aware FC-BiLSTM. Separate
-  bidirectional LSTMs model the upstream and downstream delay segments, with
-  an explicit virtual bit, loop insertion, gate, and delay combination.
+- Feed-forward Arbiter PUF: the structure-aware deep neural network. It models
+  segment delays and the feed-forward virtual-bit insertion and delay
+  recurrence, applies a weakest-bit margin auxiliary loss during training, and
+  calibrates per-bit validation thresholds to reduce row-level single-bit
+  mismatches. The deep-neural trainer also applies adaptive learning-rate
+  reduction after validation EMA plateaus.
 - XOR Arbiter PUF: one chain per response bit uses a PyTorch logistic model on
   ATT features. Two chains per bit use a degree-two ATT-feature model, which
   represents the XOR as the sign of the product of the two Arbiter delays.
   Larger groups use the parity-aware neural model.
-- Interpose PUF: a direct fully-connected/BiLSTM response model. Ordered raw
-  challenge bits are projected by a shared fully connected layer, processed as
-  a sequence by a bidirectional LSTM, then passed to a fully connected
-  response head.
+- Interpose PUF: a structure-aware, zero-hidden-layer model. It fits linear
+  Arbiter-delay/logistic components for the upstream bit and each downstream
+  chain, then composes downstream chains by parity. During training it evaluates
+  both possible upstream bits and anneals their mixture toward a hard upstream
+  decision. Inference uses the hard sign and a single downstream evaluation.
+  Downstream XOR groups use a parity-specific straight-through gradient.
 - Optical PUF: structure-aware rank-two quadratic intensity regression, fitting
   the response law `|x @ t|**2`.
 - Permutation PUF: an independent linear Arbiter score for every fixed,
@@ -38,7 +79,9 @@ With the default `attack_model="auto"`, family routing is:
   groups use a deterministic spectral initialization, alternating
   chainwise-BCE warm-up, and a direct product score trained with
   binary cross-entropy; larger groups use sign-aware straight-through parity
-  training.
+  training. Its learning rate is reduced by half after eight epochs without a
+  meaningful validation-EMA improvement, with a four-epoch cooldown and a
+  `1e-4` floor.
 - SRAM PUF: hashed responses use a random fingerprint search, testing up to 100
   candidates against the training CRPs by hashing challenge/fingerprint XOR
   rows and comparing their digests. With
@@ -55,25 +98,49 @@ hinge-loss objective. Other SVMs use raw challenge and RBF random Fourier
 features with one estimator per response bit. The XOR SVM uses PyTorch;
 `"auto"` backend selects XPU when available, while CPU SVMs use scikit-learn.
 
-The logistic-regression attack fits one model per Arbiter response bit and is a
-depth-zero, non-epoch-based estimator. FC-BiLSTM training uses `max_depth` as
-the number of recurrent layers at each progressive stage and `agents` as the
-number of independent restarts. Optical regression is also depth zero. At each
-trainable depth, the best ensemble or single-agent model is retained according
-to validation accuracy. Training stops for that instance when validation accuracy reaches
-`success_threshold`, or when it reaches the per-depth `epochs` limit. A model
-is also stopped after 10 epochs if its per-response validation accuracy never
-exceeds 50%. This screening score is computed across individual response
-values, while model selection and the success threshold continue to use
-complete-response-row accuracy. This distinction avoids prematurely rejecting
-multi-bit attacks whose individual bits are learned well but whose entire
-response rows do not yet match. This function still chooses the attack from the
-provided family; trying every family model against an unknown target is a
-separate orchestration path.
+For `ff_apuf`, `xor_apuf`, `interpose`, and `permutation`, the explicit
+`attack_model="deep_neural"` option selects a PyTorch DNN with family-specific
+structure. It learns feed-forward segment delays and inserts sign-estimated
+virtual bits into later segments; XOR and permutation models compose learned
+chain scores by parity; the Interpose model evaluates downstream predictions
+under both upstream-bit hypotheses during training and uses a hard upstream
+sign at inference. Each response bit uses its own group of downstream chains,
+matching the Interpose simulator. The requested bits are produced in one
+evaluation; repeated calls with the same deterministic challenge and PUF would
+repeat the same response. This architecture uses the PUF simulator's
+feed-forward delay recurrence. The cited
+[Fortified-Edge 2.0 paper](https://doi.org/10.3390/fi17070272) describes
+feature-abstraction for PUF-based authentication rather than the feed-forward
+Arbiter PUF delay recurrence.
+
+For Interpose PUFs, `attack_model="staged_split"` selects the same linear
+structure-aware model but alternates downstream-only and upstream-only
+optimization steps. This separates the two parameter groups while retaining
+the final-response loss; the upstream bit remains latent and is handled by the
+two-hypothesis mixture. Use
+`families=["interpose"]` with this setting. The default `auto` route instead
+jointly trains the structure-aware linear/logistic model. `attack_model="neural"`
+selects the existing hidden-layer Interpose model, while `deep_neural` selects
+the structure-aware Interpose network with the requested hidden layers.
+
+The scikit-learn logistic-regression attack for Arbiter PUFs fits one model per
+response bit and is a depth-zero, non-epoch-based estimator. Structure-aware
+Interpose logistic models train their linear components over epochs at depth
+zero; hidden-layer Interpose neural models use `max_depth` progressively.
+`agents` is the number of independent restarts. Optical regression is also
+depth zero. At each trainable depth, the best ensemble or single-agent model is
+retained according to validation accuracy. Multi-bit Interpose selects
+checkpoints by per-response element accuracy, breaking ties with complete-row
+accuracy; other families prioritize complete-row accuracy. The
+`success_threshold` remains based on complete-response-row accuracy. A model is
+also stopped after 10 epochs if its per-response validation accuracy never
+exceeds 50%. This function still chooses the attack from the provided family;
+trying every family model against an unknown target is a separate
+orchestration path.
 
 Optical regression is a depth-0 attack and does not consume neural training
 epochs. Arbiter logistic regression is also depth zero. Ring-oscillator and
-memristive attacks use depth-0 linear models; FC-BiLSTM and neural attacks
+memristive attacks use depth-0 linear models; hidden-layer neural attacks
 train progressively from depth 1.
 
 `results.json` records `activation_types` for the selected attack model and
@@ -143,14 +210,14 @@ parity-aware neural model for larger
 groups. The test scorer compares complete response rows, so every output bit
 in a row must match for that row to count as correct. Training selects the best
 checkpoint by complete-response validation accuracy, breaking ties with
-per-response element accuracy.
+per-response element accuracy, except for multi-bit Interpose, which prioritizes
+per-response element accuracy and breaks ties with complete-response accuracy.
+The success threshold always uses complete-response-row accuracy.
 With `attack_model="auto"`, permutation PUFs use their structure-aware
 per-chain ATT/parity model, which applies each chain's fixed challenge
 permutation before learning its Arbiter delay weights. The model supports
 multiple chains per response bit and keeps raw challenges in memory, computing
 the per-chain ATT features batch by batch during training.
-`ff_apuf` currently produces one response bit.
-
 Explicit `attack_model="svm"` applies SVM routing to selected non-optical
 families; optical always retains its structure-aware regression model. All
 models fit on training CRPs, use validation CRPs for selection/stopping, and
@@ -191,7 +258,7 @@ remain near chance.
 | `save_report` | `True` | Save JSON, summary, and test-response CSV files. |
 | `puf_instances` | `1000` | Number of independent PUF instances per family. |
 | `print_progress` | `False` | Print per-stage and per-epoch progress, per-instance test accuracy, and the family test summary. |
-| `attack_model` | `"auto"` | `"auto"` uses family-specific attacks, including the SRAM fingerprint search or direct logistic model according to `hash_responses`. `"neural"` or `"svm"` selects that route for non-optical families. |
+| `attack_model` | `"auto"` | `"auto"` uses family-specific attacks, including the structure-aware Interpose linear/logistic model and SRAM fingerprint search or direct logistic model according to `hash_responses`. `"neural"` or `"svm"` selects that route for non-optical families. `"deep_neural"` selects the structure-aware DNN for FF Arbiter, XOR Arbiter, Interpose, and Permutation PUFs. `"staged_split"` runs alternating upstream/downstream logistic fitting and requires `families=["interpose"]`. |
 
 `epochs` is a separate limit at every model depth and for every instance; it is
 not a single total-epoch budget. The function validates positive dimensions,
@@ -247,44 +314,57 @@ response row matches.
 
 ## Command line
 
-Run a multi-bit Arbiter attack from PowerShell:
+The entrypoint is [__main__.py](</C:/Users/jgcc1/OneDrive/Documents/Local Porting/Code for Masters/1. Capstone/code/pypuf/puf_sim/puf_ml_attack/__main__.py>):
+
+- `--list-families`: print supported default families and exit.
+- `--quick-run`: evaluator-friendly run profile (`5000/1000/1000` samples,
+  `puf_instances=1`, `max_depth=1`, `agents=1`).
+- `--show-config`: print resolved configuration before execution.
+
+Quick FF-APUF sanity run:
 
 ```powershell
 & ".\puf_env\Scripts\python.exe" -m puf_sim.puf_ml_attack `
-    --families arbiter `
+    --families ff_apuf `
+    --quick-run `
+    --print-progress
+```
+
+Reproducible FF-APUF deep-neural run on XPU:
+
+```powershell
+& ".\puf_env\Scripts\python.exe" -m puf_sim.puf_ml_attack `
+    --families ff_apuf `
+    --attack-model auto `
+    --backend torch_xpu `
+    --device 0 `
     --n 64 `
-    --response-bits 3 `
-    --training-samples 5000 `
-    --validation-samples 1000 `
-    --test-samples 1000 `
-    --puf-instances 10 `
+    --k 2 `
+    --response-bits 10 `
+    --training-samples 100000 `
+    --validation-samples 30000 `
+    --test-samples 20000 `
+    --puf-instances 1 `
+    --max-depth 1 `
+    --agents 1 `
+    --width 128 `
+    --epochs 200 `
+    --batch-size 256 `
+    --learning-rate 4e-4 `
     --success-threshold 0.95 `
-    --backend cpu `
-    --scenario iot
+    --scenario ff_apuf `
+    --print-progress `
+    --show-config
 ```
 
-By default, Arbiter uses scikit-learn logistic regression,
-single-chain-per-bit XOR-APUF uses PyTorch logistic regression, two-chain
-XOR-APUF uses the factorized rank-two model, larger XOR groups use the parity-aware
-neural model, FF-APUF uses its feed-forward-aware FC-BiLSTM, and Interpose uses
-the standard FC-BiLSTM.
-Add `--attack-model neural` to select the existing family-routed neural
-architectures, or `--attack-model svm` for SVM attacks on non-optical families.
-To run PyTorch models on XPU, add `--backend torch_xpu --device 0`. With
-`--backend auto`, PyTorch models use XPU when available and otherwise run on
-CPU.
-
-The CLI exposes the experiment options as corresponding kebab-case flags, for
-example `--no-save-report
-```
-
-Run auto routing against unhashed SRAM responses:
+SRAM auto routing without hashing:
 
 ```powershell
 & ".\puf_env\Scripts\python.exe" -m puf_sim.puf_ml_attack `
---families sram `
---n 64 `
---response-bits 64 `
---noisiness 0 `
---no-sram-hash `
---attack-model auto` and `--print-progress`.
+    --families sram `
+    --n 64 `
+    --response-bits 64 `
+    --no-sram-hash `
+    --attack-model auto `
+    --print-progress
+```

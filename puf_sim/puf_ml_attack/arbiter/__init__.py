@@ -8,7 +8,7 @@ import numpy as np
 from pypuf.simulation import ArbiterPUF
 
 from ..common import AgentTrainer as _BaseAgentTrainer, TorchPUFModel as _BaseTorchPUFModel
-from . import feed_forward, interpose, xor_apuf
+from . import deep_neural, feed_forward, interpose, xor_apuf
 
 STAGE_NAME = "arbiter_mlp_ensemble"
 
@@ -38,6 +38,7 @@ __all__ = [
     "TorchPUFModel",
     "STAGE_NAME",
     "feature_map",
+    "deep_neural",
     "feed_forward",
     "interpose",
     "xor_apuf",

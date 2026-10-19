@@ -17,10 +17,15 @@ from puf_sim.puf_ml_attack.arbiter.xor_apuf import (
 from puf_sim.puf_ml_attack.arbiter.feed_forward import (
     AgentTrainer as FeedForwardAgentTrainer,
 )
+from puf_sim.puf_ml_attack.arbiter.deep_neural import (
+    AgentTrainer as DeepNeuralAgentTrainer,
+)
 from puf_sim.puf_ml_attack.arbiter.interpose import (
     AgentTrainer as InterposeAgentTrainer,
     InterposeCore,
     InterposeTorchPUFModel,
+    LogisticAgentTrainer as InterposeLogisticAgentTrainer,
+    StagedSplitAgentTrainer as InterposeStagedSplitAgentTrainer,
 )
 from puf_sim.puf_ml_attack.svm import (
     FeatureMappedSVM,
@@ -750,7 +755,7 @@ def test_auto_routes_arbiter_families_by_architecture():
         "logistic_regression"
     )
     assert experiment._resolve_attack_model_for_family("ff_apuf", "auto") == (
-        "ff_fc_lstm"
+        "deep_neural"
     )
     assert experiment._resolve_attack_model_for_family("xor_apuf", "auto") == (
         "xor_rank_two"
@@ -762,8 +767,11 @@ def test_auto_routes_arbiter_families_by_architecture():
         "xor_apuf", "auto", n=64, k=4, response_bits=1
     ) == "neural"
     assert experiment._resolve_attack_model_for_family("interpose", "auto") == (
-        "fc_lstm"
+        "interpose_logistic_regression"
     )
+    assert experiment._resolve_attack_model_for_family(
+        "interpose", "staged_split"
+    ) == "staged_split"
     assert experiment._resolve_attack_model_for_family(
         "permutation", "auto", n=128, k=256, response_bits=128
     ) == "permutation_parity"
@@ -913,7 +921,7 @@ def test_auto_uses_arbiter_logistic_for_single_chain_xor_outputs():
     )
 
 
-def test_auto_ff_apuf_experiment_uses_feed_forward_aware_fc_bilstm():
+def test_auto_ff_apuf_experiment_uses_structure_aware_deep_neural(tmp_path):
     result = experiment.run_ml_attack_experiment(
         families=["ff_apuf"],
         n=8,
@@ -927,12 +935,291 @@ def test_auto_ff_apuf_experiment_uses_feed_forward_aware_fc_bilstm():
         epochs=1,
         batch_size=8,
         backend="cpu",
-        save_report=False,
+        report_root=str(tmp_path),
+        save_report=True,
         puf_instances=1,
+        attack_model="auto",
     )["ff_apuf"]["instances"][0]
 
-    assert result["model_architecture"] == "ff_fc_lstm"
-    assert result["attack"] == "ff_apuf_structure_aware_fc_bilstm"
+    assert result["model_architecture"] == "deep_neural"
+    assert result["attack"] == "structure_aware_deep_neural_ff_apuf"
+    epoch = result["stages"][0]["epoch_history"][0]
+    assert epoch["epoch"] == 1
+    assert 0.0 <= epoch["validation_accuracy"] <= 1.0
+    assert 0.0 <= epoch["validation_element_accuracy"] <= 1.0
+    assert epoch["validation_emas"] == [epoch["validation_accuracy"]]
+    assert epoch["learning_rates"] == [0.001]
+    assert epoch["lr_events"] == []
+    report_path = next(tmp_path.rglob("results.json"))
+    with report_path.open(encoding="utf-8") as report_file:
+        saved_result = json.load(report_file)
+    saved_epoch = saved_result["ff_apuf"]["instances"][0]["stages"][0][
+        "epoch_history"
+    ][0]
+    assert saved_epoch == epoch
+
+
+def test_auto_interpose_uses_structure_aware_logistic_model():
+    result = experiment.run_ml_attack_experiment(
+        families=["interpose"],
+        n=8,
+        training_samples=32,
+        validation_samples=8,
+        test_samples=8,
+        seed=329,
+        k=2,
+        response_bits=1,
+        success_threshold=1.0,
+        max_depth=1,
+        agents=1,
+        width=8,
+        epochs=1,
+        batch_size=8,
+        backend="cpu",
+        save_report=False,
+        puf_instances=1,
+        attack_model="auto",
+    )["interpose"]["instances"][0]
+
+    assert result["model_architecture"] == "interpose_logistic_regression"
+    assert result["attack"] == "interpose_structure_aware_logistic_regression"
+    assert result["activation_types"]["hidden_layers"] == []
+
+
+def test_staged_split_interpose_runs_alternating_logistic_fit():
+    result = experiment.run_ml_attack_experiment(
+        families=["interpose"],
+        n=8,
+        training_samples=32,
+        validation_samples=8,
+        test_samples=8,
+        seed=330,
+        k=2,
+        response_bits=1,
+        success_threshold=1.0,
+        max_depth=1,
+        agents=1,
+        width=8,
+        epochs=1,
+        batch_size=8,
+        backend="cpu",
+        save_report=False,
+        puf_instances=1,
+        attack_model="staged_split",
+    )["interpose"]["instances"][0]
+
+    assert result["model_architecture"] == "staged_split"
+    assert result["attack"] == "interpose_staged_split_logistic_regression"
+    assert "Alternating downstream and upstream logistic fitting" in (
+        result["activation_types"]["internal_layers"]
+    )
+
+
+def test_deep_neural_xor_experiment_records_learning_rate_history(tmp_path):
+    result = experiment.run_ml_attack_experiment(
+        families=["xor_apuf"],
+        n=8,
+        training_samples=16,
+        validation_samples=8,
+        test_samples=8,
+        seed=333,
+        k=2,
+        response_bits=1,
+        max_depth=1,
+        agents=1,
+        width=8,
+        epochs=1,
+        batch_size=8,
+        backend="cpu",
+        report_root=str(tmp_path),
+        save_report=True,
+        puf_instances=1,
+        attack_model="deep_neural",
+    )["xor_apuf"]["instances"][0]
+
+    assert result["model_architecture"] == "deep_neural"
+    epoch = result["stages"][0]["epoch_history"][0]
+    assert epoch["epoch"] == 1
+    assert 0.0 <= epoch["validation_accuracy"] <= 1.0
+    assert epoch["validation_emas"] == [epoch["validation_accuracy"]]
+    assert epoch["learning_rates"] == [0.001]
+    assert epoch["lr_events"] == []
+    report_path = next(tmp_path.rglob("results.json"))
+    with report_path.open(encoding="utf-8") as report_file:
+        saved_result = json.load(report_file)
+    saved_epoch = saved_result["xor_apuf"]["instances"][0]["stages"][0][
+        "epoch_history"
+    ][0]
+    assert saved_epoch == epoch
+
+
+def test_ff_learning_rate_reduces_on_plateau_to_floor():
+    import torch
+
+    challenges = np.array([[-1, 1], [1, -1]], dtype=np.int8)
+    responses = np.array([[-1, 1], [1, -1]], dtype=np.int8)
+    trainer = DeepNeuralAgentTrainer(
+        challenges,
+        responses,
+        response_bits=2,
+        hidden_layers=1,
+        width=4,
+        seed=1,
+        batch_size=2,
+        learning_rate=4e-4,
+        device=torch.device("cpu"),
+        family_key="ff_apuf",
+        feed_forward_loops=[(0, 1)],
+    )
+
+    for epoch in range(1, 18):
+        trainer._epochs_trained = epoch
+        trainer.update_validation_feedback(0.8)
+
+    assert trainer.learning_rate == 1e-4
+    assert [event["epoch"] for event in trainer.consume_lr_events()] == [
+        9.0,
+        17.0,
+    ]
+
+
+def test_ff_learning_rate_does_not_reduce_during_validation_improvement():
+    import torch
+
+    challenges = np.array([[-1, 1], [1, -1]], dtype=np.int8)
+    responses = np.array([[-1, 1], [1, -1]], dtype=np.int8)
+    trainer = DeepNeuralAgentTrainer(
+        challenges,
+        responses,
+        response_bits=2,
+        hidden_layers=1,
+        width=4,
+        seed=2,
+        batch_size=2,
+        learning_rate=4e-4,
+        device=torch.device("cpu"),
+        family_key="ff_apuf",
+        feed_forward_loops=[(0, 1)],
+    )
+
+    for epoch in range(1, 21):
+        trainer._epochs_trained = epoch
+        trainer.update_validation_feedback(0.8 + 0.002 * (epoch - 1))
+
+    assert trainer.learning_rate == 4e-4
+    assert trainer.consume_lr_events() == []
+
+
+def test_xor_learning_rate_reduces_on_plateau_to_floor():
+    import torch
+
+    challenges = np.array([[-1, 1], [1, -1]], dtype=np.int8)
+    responses = np.array([[-1], [1]], dtype=np.int8)
+    trainer = DeepNeuralAgentTrainer(
+        challenges,
+        responses,
+        response_bits=1,
+        hidden_layers=1,
+        width=4,
+        seed=3,
+        batch_size=2,
+        learning_rate=4e-4,
+        device=torch.device("cpu"),
+        family_key="xor_apuf",
+        chain_count=2,
+    )
+
+    for epoch in range(1, 18):
+        trainer._epochs_trained = epoch
+        trainer.update_validation_feedback(0.8)
+
+    assert trainer.learning_rate == 1e-4
+    assert [event["epoch"] for event in trainer.consume_lr_events()] == [
+        9.0,
+        17.0,
+    ]
+
+
+def test_permutation_learning_rate_reduces_on_plateau_to_floor():
+    import torch
+
+    challenges = np.array([[-1, 1], [1, -1]], dtype=np.int8)
+    responses = np.array([[-1], [1]], dtype=np.int8)
+    trainer = experiment._permutation.AgentTrainer(
+        challenges,
+        responses,
+        response_bits=1,
+        hidden_layers=1,
+        width=4,
+        seed=4,
+        batch_size=2,
+        learning_rate=4e-4,
+        device=torch.device("cpu"),
+        permutation_table=np.array([[0, 1]]),
+    )
+
+    for epoch in range(1, 18):
+        trainer._epochs_trained = epoch
+        trainer.update_validation_feedback(0.8)
+
+    assert trainer.learning_rate == 1e-4
+    assert [event["epoch"] for event in trainer.consume_lr_events()] == [
+        9.0,
+        17.0,
+    ]
+
+
+def test_auto_permutation_experiment_records_learning_rate_history(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        experiment,
+        "_pair_accuracy",
+        lambda model, dataset: 0.75,
+    )
+    result = experiment.run_ml_attack_experiment(
+        families=["permutation"],
+        n=16,
+        k=1,
+        response_bits=1,
+        training_samples=8,
+        validation_samples=8,
+        test_samples=8,
+        seed=446,
+        success_threshold=1.0,
+        max_depth=1,
+        agents=1,
+        width=8,
+        epochs=9,
+        batch_size=4,
+        learning_rate=0.001,
+        backend="cpu",
+        report_root=str(tmp_path),
+        save_report=True,
+        puf_instances=1,
+        attack_model="auto",
+        print_progress=False,
+    )["permutation"]["instances"][0]
+
+    assert result["model_architecture"] == "permutation_parity"
+    history = result["stages"][0]["epoch_history"]
+    assert len(history) == 9
+    epoch = history[-1]
+    assert epoch["epoch"] == 9
+    assert epoch["validation_emas"] == [0.75]
+    assert epoch["learning_rates"] == [0.0005]
+    assert epoch["lr_events"] == [{
+        "epoch": 9.0,
+        "ema": 0.75,
+        "lr": 0.0005,
+    }]
+    report_path = next(tmp_path.rglob("results.json"))
+    with report_path.open(encoding="utf-8") as report_file:
+        saved_result = json.load(report_file)
+    saved_epoch = saved_result["permutation"]["instances"][0]["stages"][0][
+        "epoch_history"
+    ]
+    assert saved_epoch == history
 
 
 def test_feed_forward_aware_fc_bilstm_trains_and_predicts():
@@ -1369,6 +1656,223 @@ def test_interpose_model_matches_simulator_with_target_weights():
     )
 
 
+def test_interpose_parity_gradient_does_not_vanish_for_large_groups():
+    import torch
+
+    model = InterposeCore(
+        n=64,
+        down_chain_count=64,
+        interpose_pos=32,
+        seed=30,
+        hidden_layers=0,
+        response_bits=10,
+    )
+    with torch.no_grad():
+        model.down_weights.weight.zero_()
+        model.down_weights.bias.zero_()
+
+    model(torch.zeros((2, 64), dtype=torch.float32)).sum().backward()
+
+    assert model.down_weights.bias.grad is not None
+    assert torch.isfinite(model.down_weights.bias.grad).all()
+    assert torch.all(model.down_weights.bias.grad.abs() > 0)
+
+
+def test_interpose_training_marginalizes_upstream_signs_and_anneals_gate():
+    import torch
+
+    model = InterposeCore(
+        n=2,
+        down_chain_count=1,
+        interpose_pos=1,
+        seed=30,
+        hidden_layers=0,
+    )
+    with torch.no_grad():
+        model.up_weights.weight.zero_()
+        model.up_weights.bias.fill_(1.0)
+        model.down_weights.weight.zero_()
+        model.down_weights.weight[0, 1] = 1.0
+        model.down_weights.bias.zero_()
+
+    challenges = torch.ones((1, 2), dtype=torch.float32)
+    model.train()
+    mixture_prediction = model(challenges)
+    mixture_prediction.sum().backward()
+    assert model.up_weights.bias.grad is not None
+    assert torch.all(model.up_weights.bias.grad.abs() > 0)
+    model.eval()
+    hard_prediction = model(challenges)
+
+    assert not torch.allclose(mixture_prediction, hard_prediction)
+
+    puf = create_puf("interpose", n=8, seed=30, k=2)
+    training_challenges = np.random.default_rng(31).choice(
+        (-1, 1), size=(8, puf.challenge_length)
+    ).astype(np.int8)
+    trainer = InterposeLogisticAgentTrainer(
+        training_challenges,
+        puf.eval(training_challenges),
+        response_bits=1,
+        hidden_layers=0,
+        width=8,
+        seed=32,
+        batch_size=4,
+        learning_rate=0.001,
+        device=torch.device("cpu"),
+        down_chain_count=puf.down.k,
+        interpose_pos=puf.interpose_pos,
+    )
+    initial_temperature = trainer.model.interpose_temperature
+    trainer.train_epoch()
+    trainer.train_epoch()
+
+    assert trainer.model.interpose_temperature < initial_temperature
+
+
+def test_interpose_multibit_checkpoint_selection_prioritizes_element_accuracy():
+    interpose_key = experiment._validation_selection_key(
+        "interpose",
+        response_bits=10,
+        exact_accuracy=0.80,
+        element_accuracy=0.75,
+    )
+    competing_interpose_key = experiment._validation_selection_key(
+        "interpose",
+        response_bits=10,
+        exact_accuracy=0.85,
+        element_accuracy=0.70,
+    )
+    arbiter_key = experiment._validation_selection_key(
+        "arbiter",
+        response_bits=10,
+        exact_accuracy=0.80,
+        element_accuracy=0.75,
+    )
+    competing_arbiter_key = experiment._validation_selection_key(
+        "arbiter",
+        response_bits=10,
+        exact_accuracy=0.85,
+        element_accuracy=0.70,
+    )
+
+    assert interpose_key > competing_interpose_key
+    assert arbiter_key < competing_arbiter_key
+
+
+def test_interpose_neural_attacks_train_with_ten_response_bits():
+    import torch
+
+    response_bits = 10
+    puf = create_puf(
+        "interpose",
+        n=12,
+        k=20,
+        response_bits=response_bits,
+        interpose_pos=5,
+        seed=31,
+    )
+    challenges = np.random.default_rng(32).choice(
+        (-1, 1), size=(8, puf.challenge_length)
+    ).astype(np.int8)
+    responses = puf.eval(challenges)
+    assert responses.shape == (len(challenges), response_bits)
+
+    exact_model = InterposeCore(
+        puf.challenge_length,
+        puf.down.k,
+        puf.interpose_pos,
+        seed=30,
+        hidden_layers=0,
+        response_bits=response_bits,
+    )
+    with torch.no_grad():
+        exact_model.up_weights.weight.copy_(
+            torch.as_tensor(puf.up.weight_array[:, :-1], dtype=torch.float32)
+        )
+        exact_model.up_weights.bias.copy_(
+            torch.as_tensor(puf.up.weight_array[:, -1], dtype=torch.float32)
+        )
+        exact_model.down_weights.weight.copy_(
+            torch.as_tensor(puf.down.weight_array[:, :-1], dtype=torch.float32)
+        )
+        exact_model.down_weights.bias.copy_(
+            torch.as_tensor(puf.down.weight_array[:, -1], dtype=torch.float32)
+        )
+    exact_adapter = InterposeTorchPUFModel(
+        [exact_model],
+        puf.challenge_length,
+        response_bits,
+        torch.device("cpu"),
+    )
+    np.testing.assert_array_equal(exact_adapter.eval(challenges), responses)
+
+    legacy_trainer = InterposeAgentTrainer(
+        challenges,
+        responses,
+        response_bits=response_bits,
+        hidden_layers=1,
+        width=8,
+        seed=33,
+        batch_size=4,
+        learning_rate=0.001,
+        device=torch.device("cpu"),
+        down_chain_count=puf.down.k,
+        interpose_pos=puf.interpose_pos,
+    )
+    assert legacy_trainer.model(
+        torch.as_tensor(challenges, dtype=torch.float32)
+    ).shape == (len(challenges), response_bits)
+    legacy_trainer.train_epoch()
+
+    for trainer_type in (
+        InterposeLogisticAgentTrainer,
+        InterposeStagedSplitAgentTrainer,
+    ):
+        logistic_trainer = trainer_type(
+            challenges,
+            responses,
+            response_bits=response_bits,
+            hidden_layers=0,
+            width=8,
+            seed=35,
+            batch_size=4,
+            learning_rate=0.001,
+            device=torch.device("cpu"),
+            down_chain_count=puf.down.k,
+            interpose_pos=puf.interpose_pos,
+        )
+        assert logistic_trainer.model(
+            torch.as_tensor(challenges, dtype=torch.float32)
+        ).shape == (len(challenges), response_bits)
+        initial_temperature = logistic_trainer.model.interpose_temperature
+        logistic_trainer.train_epoch()
+        logistic_trainer.train_epoch()
+        assert logistic_trainer.model.interpose_temperature < initial_temperature
+
+    deep_trainer = DeepNeuralAgentTrainer(
+        challenges,
+        responses,
+        response_bits=response_bits,
+        hidden_layers=1,
+        width=8,
+        seed=34,
+        batch_size=4,
+        learning_rate=0.001,
+        device=torch.device("cpu"),
+        family_key="interpose",
+        down_chain_count=puf.down.k,
+        interpose_pos=puf.interpose_pos,
+    )
+    assert deep_trainer.model(
+        torch.as_tensor(challenges, dtype=torch.float32)
+    ).shape == (len(challenges), response_bits)
+    initial_temperature = deep_trainer.model.interpose_temperature
+    deep_trainer.train_epoch()
+    deep_trainer.train_epoch()
+    assert deep_trainer.model.interpose_temperature < initial_temperature
+
+
 def test_train_until_threshold_reports_effort(monkeypatch, capsys):
     class DatasetFactory:
         @staticmethod
@@ -1663,10 +2167,8 @@ def test_activation_profiles_cover_all_default_families():
         "Product parity",
     ]
     assert profiles["interpose"]["internal_layers"] == [
-        "SignSTE",
-        "Tanh chain scores",
-        "Product parity",
-        "Tanh parity score",
+        "Annealed mixture over both upstream-bit hypotheses",
+        "Downstream XOR parity with sign-aware STE gradients",
     ]
     assert profiles["ring_oscillator"]["hidden_layers"] == []
     assert profiles["memristive"]["hidden_layers"] == []

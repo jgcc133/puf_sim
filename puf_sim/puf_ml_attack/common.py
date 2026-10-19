@@ -31,12 +31,28 @@ def _make_hidden_stack(
 class TorchPUFModel(Simulation):
     """Adapt one or more PyTorch classifiers to pypuf's simulation interface."""
 
-    def __init__(self, models: Sequence[Any], n: int, response_bits: int, device: Any):
+    def __init__(
+        self,
+        models: Sequence[Any],
+        n: int,
+        response_bits: int,
+        device: Any,
+        response_thresholds: Optional[np.ndarray] = None,
+    ):
         super().__init__()
         self.models = list(models)
         self._n = n
         self._response_bits = response_bits
         self.device = device
+        if response_thresholds is None:
+            self.response_thresholds = None
+        else:
+            threshold_vector = np.asarray(response_thresholds, dtype=np.float32).reshape(-1)
+            if len(threshold_vector) != response_bits:
+                raise ValueError(
+                    "response_thresholds length must match response_bits."
+                )
+            self.response_thresholds = threshold_vector
 
     @property
     def challenge_length(self) -> int:
@@ -46,13 +62,32 @@ class TorchPUFModel(Simulation):
     def response_length(self) -> int:
         return self._response_bits
 
-    def eval(self, challenges: np.ndarray) -> np.ndarray:
+    def _ensemble_logits(self, challenges: np.ndarray) -> Any:
         import torch
 
         inputs = torch.as_tensor(challenges, dtype=torch.float32, device=self.device)
+        for model in self.models:
+            model.eval()
         with torch.no_grad():
-            logits = torch.stack([model(inputs) for model in self.models]).mean(dim=0)
-            return torch.where(logits >= 0, 1, -1).to(torch.int8).cpu().numpy()
+            return torch.stack([model(inputs) for model in self.models]).mean(dim=0)
+
+    def eval(self, challenges: np.ndarray) -> np.ndarray:
+        import torch
+
+        logits = self._ensemble_logits(challenges)
+        if self.response_thresholds is None:
+            thresholds = torch.zeros(
+                (1, self._response_bits),
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+        else:
+            thresholds = torch.as_tensor(
+                self.response_thresholds,
+                dtype=logits.dtype,
+                device=logits.device,
+            ).reshape(1, self._response_bits)
+        return torch.where(logits >= thresholds, 1, -1).to(torch.int8).cpu().numpy()
 
 
 class AgentTrainer:

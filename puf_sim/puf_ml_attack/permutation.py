@@ -272,8 +272,76 @@ class AgentTrainer:
             device=device,
         )
         self.batch_size = batch_size
+        self._epochs_trained = 0
+        self._validation_ema: float | None = None
+        self._validation_ema_alpha = 0.35
+        self._best_validation_ema: float | None = None
+        self._epochs_without_ema_improvement = 0
+        self._lr_plateau_patience = 8
+        self._lr_min_ema_improvement = 0.001
+        self._lr_reduce_factor = 0.5
+        self._lr_reduce_cooldown_epochs = 4
+        self._epochs_since_lr_drop = 0
+        self._lr_floor = 1e-4
+        self._lr_events: list[dict[str, float]] = []
         if self.rank_two:
             self._pretrain_chain_factors()
+
+    def update_validation_feedback(self, validation_accuracy: float) -> None:
+        value = float(validation_accuracy)
+        self._epochs_since_lr_drop += 1
+        if self._validation_ema is None:
+            self._validation_ema = value
+            self._best_validation_ema = value
+            return
+
+        self._validation_ema = (
+            self._validation_ema_alpha * value
+            + (1.0 - self._validation_ema_alpha) * self._validation_ema
+        )
+        if (
+            self._best_validation_ema is None
+            or self._validation_ema
+            > self._best_validation_ema + self._lr_min_ema_improvement
+        ):
+            self._best_validation_ema = self._validation_ema
+            self._epochs_without_ema_improvement = 0
+        else:
+            self._epochs_without_ema_improvement += 1
+        if (
+            self._epochs_without_ema_improvement < self._lr_plateau_patience
+            or self._epochs_since_lr_drop < self._lr_reduce_cooldown_epochs
+        ):
+            return
+
+        reduced = False
+        for parameter_group in self.optimizer.param_groups:
+            current_lr = float(parameter_group["lr"])
+            next_lr = max(self._lr_floor, current_lr * self._lr_reduce_factor)
+            if next_lr < current_lr:
+                parameter_group["lr"] = next_lr
+                reduced = True
+        if reduced:
+            self._lr_events.append({
+                "epoch": float(self._epochs_trained),
+                "ema": float(self._validation_ema),
+                "lr": float(self.optimizer.param_groups[0]["lr"]),
+            })
+            self._epochs_since_lr_drop = 0
+            self._epochs_without_ema_improvement = 0
+
+    @property
+    def learning_rate(self) -> float:
+        return float(self.optimizer.param_groups[0]["lr"])
+
+    @property
+    def validation_ema(self) -> float | None:
+        return self._validation_ema
+
+    def consume_lr_events(self) -> list[dict[str, float]]:
+        events = list(self._lr_events)
+        self._lr_events.clear()
+        return events
 
     def _pretrain_chain_factors(self) -> None:
         import torch
@@ -339,6 +407,7 @@ class AgentTrainer:
                 )
             loss.backward()
             self.optimizer.step()
+        self._epochs_trained += 1
 
 
 __all__ = ["AgentTrainer", "STAGE_NAME", "_PermutationChainModel"]

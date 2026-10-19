@@ -86,7 +86,7 @@ def _resolve_attack_model_for_family(
         if family_key == "permutation":
             return "permutation_parity"
         if family_key == "ff_apuf":
-            return "ff_fc_lstm"
+            return "deep_neural"
         if family_key in {"xor_apuf", "xor_arbiter"}:
             effective_chain_count = n if k is None else max(k, response_bits)
             if response_bits > 0:
@@ -99,7 +99,7 @@ def _resolve_attack_model_for_family(
                     return "xor_rank_two"
             return "neural"
         if family_key == "interpose":
-            return "fc_lstm"
+            return "interpose_logistic_regression"
         return "neural"
     return attack_model
 
@@ -123,6 +123,81 @@ def _response_element_accuracy(
     else:
         matches = predicted == expected
     return float(np.mean(matches))
+
+
+def _validation_selection_key(
+    family_key: str,
+    response_bits: int,
+    exact_accuracy: float,
+    element_accuracy: float,
+) -> tuple[float, float]:
+    if family_key == "interpose" and response_bits > 1:
+        return element_accuracy, exact_accuracy
+    return exact_accuracy, element_accuracy
+
+
+def _optimal_bipolar_thresholds(
+    logits: np.ndarray, responses: np.ndarray
+) -> np.ndarray:
+    score_matrix = np.asarray(logits, dtype=np.float32)
+    response_matrix = np.asarray(responses).reshape(len(score_matrix), -1)
+    if len(score_matrix) == 0:
+        return np.zeros((response_matrix.shape[1],), dtype=np.float32)
+    thresholds = np.zeros((response_matrix.shape[1],), dtype=np.float32)
+    for bit_index in range(response_matrix.shape[1]):
+        bit_scores = score_matrix[:, bit_index]
+        bit_labels = np.where(response_matrix[:, bit_index] > 0, 1, -1).astype(
+            np.int8
+        )
+        sorted_order = np.argsort(bit_scores, kind="mergesort")
+        sorted_scores = bit_scores[sorted_order]
+        sorted_labels = bit_labels[sorted_order]
+        positive_count = int(np.count_nonzero(bit_labels == 1))
+        best_correct = positive_count
+        current_correct = positive_count
+        best_threshold = float(sorted_scores[0] - 1.0)
+        index = 0
+        while index < len(sorted_scores):
+            score_value = sorted_scores[index]
+            next_index = index
+            positive_at_value = 0
+            negative_at_value = 0
+            while (
+                next_index < len(sorted_scores)
+                and sorted_scores[next_index] == score_value
+            ):
+                if sorted_labels[next_index] == 1:
+                    positive_at_value += 1
+                else:
+                    negative_at_value += 1
+                next_index += 1
+            current_correct -= positive_at_value
+            current_correct += negative_at_value
+            if next_index < len(sorted_scores):
+                candidate_threshold = float(
+                    (score_value + sorted_scores[next_index]) / 2.0
+                )
+            else:
+                candidate_threshold = float(score_value + 1.0)
+            if current_correct > best_correct:
+                best_correct = current_correct
+                best_threshold = candidate_threshold
+            index = next_index
+        thresholds[bit_index] = best_threshold
+    return thresholds
+
+
+def _calibrate_model_thresholds(
+    models: Sequence[Any],
+    dataset: ChallengeResponseSet,
+    device: Any,
+) -> np.ndarray:
+    import torch
+
+    inputs = torch.as_tensor(dataset.challenges, dtype=torch.float32, device=device)
+    with torch.no_grad():
+        logits = torch.stack([model(inputs) for model in models]).mean(dim=0)
+    return _optimal_bipolar_thresholds(logits.cpu().numpy(), dataset.responses)
 
 
 def _activation_profile(family_key: str, depth: int) -> Dict[str, Any]:
@@ -158,10 +233,8 @@ def _activation_profile(family_key: str, depth: int) -> Dict[str, Any]:
         profile.update({
             "hidden_layers": ["Tanh"] * (2 * depth),
             "internal_layers": [
-                "SignSTE",
-                "Tanh chain scores",
-                "Product parity",
-                "Tanh parity score",
+                "Annealed mixture over both upstream-bit hypotheses",
+                "Downstream XOR parity with sign-aware STE gradients",
             ],
             "output_layer": "Parity score",
         })
@@ -232,6 +305,34 @@ def _model_profile(
             "output_layer": "Arbiter-score product",
             "prediction": "Bipolar threshold",
         }
+    if attack_model in {
+        "interpose_logistic_regression",
+        "staged_split",
+    }:
+        return {
+            "feature_mapping": [
+                "Arbiter Threshold Transform for upstream and downstream challenges"
+            ],
+            "estimator": (
+                "Linear logistic Arbiter scores with a two-hypothesis "
+                "upstream-bit mixture and downstream XOR composition"
+            ),
+            "hidden_layers": [],
+            "internal_layers": (
+                [
+                    "Alternating downstream and upstream logistic fitting",
+                    "Annealed mixture over both upstream-bit hypotheses",
+                    "Downstream XOR parity per response bit",
+                ]
+                if attack_model == "staged_split"
+                else [
+                    "Annealed mixture over both upstream-bit hypotheses",
+                    "Downstream XOR parity per response bit",
+                ]
+            ),
+            "output_layer": "Parity score",
+            "prediction": "Bipolar threshold",
+        }
     if attack_model == "ff_fc_lstm":
         return {
             "feature_mapping": [
@@ -265,6 +366,38 @@ def _model_profile(
                 "Sign-aware straight-through parity for larger groups",
             ],
             "output_layer": "Parity score per response bit",
+            "prediction": "Bipolar threshold",
+        }
+    if attack_model == "deep_neural":
+        family_operations = {
+            "ff_apuf": [
+                "Lane-specific affine delay estimators",
+                "Segment delay residual DNNs",
+                "SignSTE virtual-bit insertion",
+                "Feed-forward delay recurrence",
+            ],
+            "xor_apuf": [
+                "Arbiter Threshold Transform",
+                "Deep chain-score network",
+                "Sign-aware parity composition",
+            ],
+            "interpose": [
+                "Upstream Arbiter DNN",
+                "Annealed mixture over both upstream-bit hypotheses",
+                "Downstream XOR Arbiter DNN",
+            ],
+            "permutation": [
+                "Fixed per-chain challenge permutation",
+                "Per-chain Arbiter Threshold Transform",
+                "Sign-aware parity composition",
+            ],
+        }
+        return {
+            "feature_mapping": ["Family-specific Arbiter challenge features"],
+            "estimator": "PyTorch structure-aware deep neural network",
+            "hidden_layers": ["Linear + Tanh"] * depth,
+            "internal_layers": family_operations.get(family_key, []),
+            "output_layer": "Family-specific delay or chain scores",
             "prediction": "Bipolar threshold",
         }
     if attack_model == "fc_lstm":
@@ -342,6 +475,7 @@ def _attack_one_puf(
     best_model: Optional[Simulation] = None
     best_validation_accuracy = -1.0
     best_validation_element_accuracy = -1.0
+    best_validation_selection_key = (-1.0, -1.0)
     selected_stage = "neural_ensemble"
     selected_depth = 1
     selected_agent_count = agents
@@ -356,6 +490,9 @@ def _attack_one_puf(
     stage_history: list[Dict[str, Any]] = []
 
     family_key = _normalize_family_key(family)
+    select_by_element_accuracy = (
+        family_key == "interpose" and target.response_length > 1
+    )
     if attack_model == "neural" and family_key in {"xor_apuf", "xor_arbiter"}:
         chains_per_bit, remainder = divmod(target.k, target.response_length)
         if remainder == 0 and chains_per_bit == 2:
@@ -377,6 +514,29 @@ def _attack_one_puf(
             _fc_lstm.FF_APUF_STAGE_NAME
             if attack_model == "ff_fc_lstm"
             else _fc_lstm.STAGE_NAME
+        )
+        pair_accuracy_fn = _pair_accuracy
+    elif attack_model == "deep_neural":
+        trainer_type = _arbiter.deep_neural.AgentTrainer
+        model_type = _TorchPUFModel
+        stage_name = (
+            f"{_arbiter.deep_neural.STAGE_NAME}_{family_key}"
+        )
+        pair_accuracy_fn = _pair_accuracy
+    elif attack_model in {
+        "interpose_logistic_regression",
+        "staged_split",
+    }:
+        trainer_type = (
+            _arbiter.interpose.StagedSplitAgentTrainer
+            if attack_model == "staged_split"
+            else _arbiter.interpose.LogisticAgentTrainer
+        )
+        model_type = _arbiter.interpose.InterposeTorchPUFModel
+        stage_name = (
+            _arbiter.interpose.STAGED_SPLIT_STAGE_NAME
+            if attack_model == "staged_split"
+            else _arbiter.interpose.LOGISTIC_STAGE_NAME
         )
         pair_accuracy_fn = _pair_accuracy
     elif attack_model == "xor_logistic_regression":
@@ -453,7 +613,11 @@ def _attack_one_puf(
     else:
         raise ValueError(f"Unsupported PUF family for ML attack: {family!r}.")
 
-    def build_attack_model(models: Sequence[Any], model_device: Any) -> Simulation:
+    def build_attack_model(
+        models: Sequence[Any],
+        model_device: Any,
+        response_thresholds: Optional[np.ndarray] = None,
+    ) -> Simulation:
         if attack_model in {"fc_lstm", "ff_fc_lstm"}:
             return model_type(
                 models,
@@ -461,6 +625,14 @@ def _attack_one_puf(
                 target.response_length,
                 model_device,
                 inference_batch_size=batch_size,
+            )
+        if response_thresholds is not None and attack_model == "deep_neural":
+            return model_type(
+                models,
+                n,
+                target.response_length,
+                model_device,
+                response_thresholds=response_thresholds,
             )
         return model_type(models, n, target.response_length, model_device)
 
@@ -646,6 +818,8 @@ def _attack_one_puf(
         "xor_quadratic",
         "xor_rank_two",
         "permutation_parity",
+        "interpose_logistic_regression",
+        "staged_split",
     }:
         stages = [(0, agents)]
     elif family_key in {"ring_oscillator", "memristive"}:
@@ -694,6 +868,29 @@ def _attack_one_puf(
                     *trainer_arguments,
                     permutation_table=target._permutation_table,
                 ))
+            elif attack_model in {
+                "interpose_logistic_regression",
+                "staged_split",
+            }:
+                trainers.append(trainer_type(
+                    *trainer_arguments,
+                    down_chain_count=target.down.k,
+                    interpose_pos=target.interpose_pos,
+                ))
+            elif attack_model == "deep_neural":
+                trainers.append(trainer_type(
+                    *trainer_arguments,
+                    family_key=family_key,
+                    chain_count=getattr(target, "k", None),
+                    feed_forward_loops=getattr(target, "ff", None),
+                    interpose_pos=getattr(target, "interpose_pos", None),
+                    down_chain_count=getattr(
+                        getattr(target, "down", None), "k", None
+                    ),
+                    permutation_table=getattr(
+                        target, "_permutation_table", None
+                    ),
+                ))
             elif attack_model == "ff_fc_lstm":
                 trainers.append(trainer_type(
                     *trainer_arguments,
@@ -727,15 +924,36 @@ def _attack_one_puf(
             "validation_element_accuracy": None,
             "fit_elapsed_seconds": float(trainer_setup_seconds),
         })
+        track_training_history = attack_model in {
+            "deep_neural",
+            "permutation_parity",
+        } or select_by_element_accuracy
+        if track_training_history:
+            stage_history[-1]["epoch_history"] = []
         while True:
             epoch_start = time.perf_counter()
             for trainer in trainers:
                 trainer.train_epoch()
+            apply_threshold_calibration = (
+                attack_model == "deep_neural"
+                and family_key == "ff_apuf"
+                and target.response_length > 1
+            )
+            ensemble_thresholds = (
+                _calibrate_model_thresholds(
+                    [trainer.model for trainer in trainers], validation, device
+                )
+                if apply_threshold_calibration
+                else None
+            )
             model = build_attack_model(
-                [trainer.model for trainer in trainers], device
+                [trainer.model for trainer in trainers],
+                device,
+                response_thresholds=ensemble_thresholds,
             )
             validation_accuracy = pair_accuracy_fn(model, validation)
             candidate_trainer_models = [[trainer.model for trainer in trainers]]
+            candidate_thresholds = [ensemble_thresholds]
             candidate_accuracies = [validation_accuracy]
             candidate_element_accuracies = [
                 _response_element_accuracy(model, validation, family_key)
@@ -746,8 +964,18 @@ def _attack_one_puf(
                 # a confident-but-wrong one. Also consider each agent alone so
                 # one straggler cannot cap the whole ensemble's accuracy.
                 for trainer in trainers:
-                    solo_model = build_attack_model([trainer.model], device)
+                    solo_thresholds = (
+                        _calibrate_model_thresholds(
+                            [trainer.model], validation, device
+                        )
+                        if apply_threshold_calibration
+                        else None
+                    )
+                    solo_model = build_attack_model(
+                        [trainer.model], device, response_thresholds=solo_thresholds
+                    )
                     candidate_trainer_models.append([trainer.model])
+                    candidate_thresholds.append(solo_thresholds)
                     candidate_accuracies.append(pair_accuracy_fn(solo_model, validation))
                     candidate_element_accuracies.append(
                         _response_element_accuracy(
@@ -756,16 +984,40 @@ def _attack_one_puf(
                     )
             best_candidate_index = max(
                 range(len(candidate_accuracies)),
-                key=lambda index: (
+                key=lambda index: _validation_selection_key(
+                    family_key,
+                    target.response_length,
                     candidate_accuracies[index],
                     candidate_element_accuracies[index],
                 ),
             )
             selected_trainer_models = candidate_trainer_models[best_candidate_index]
+            selected_response_thresholds = candidate_thresholds[best_candidate_index]
             validation_accuracy = candidate_accuracies[best_candidate_index]
             validation_element_accuracy = candidate_element_accuracies[
                 best_candidate_index
             ]
+            for trainer in trainers:
+                update_fn = getattr(trainer, "update_validation_feedback", None)
+                if callable(update_fn):
+                    update_fn(
+                        validation_element_accuracy
+                        if select_by_element_accuracy
+                        else validation_accuracy
+                    )
+            lr_events = []
+            for trainer in trainers:
+                consume_fn = getattr(trainer, "consume_lr_events", None)
+                if callable(consume_fn):
+                    lr_events.extend(consume_fn())
+            lr_note = ""
+            if print_progress and lr_events:
+                latest_event = lr_events[-1]
+                lr_note = (
+                    " | lr reduced to "
+                    f"{latest_event['lr']:.1e}"
+                    f" (EMA {latest_event['ema']:.4%})"
+                )
             if epochs_trained <= MODEL_SCREENING_EPOCHS:
                 screening_element_accuracy = max(
                     screening_element_accuracy, validation_element_accuracy
@@ -784,23 +1036,47 @@ def _attack_one_puf(
                 validation_element_accuracy
             )
             stage_history[-1]["fit_elapsed_seconds"] += float(elapsed)
+            if track_training_history:
+                stage_history[-1]["epoch_history"].append({
+                    "epoch": stage_history[-1]["epochs"],
+                    "validation_accuracy": float(validation_accuracy),
+                    "validation_element_accuracy": float(
+                        validation_element_accuracy
+                    ),
+                    "validation_emas": [
+                        getattr(trainer, "validation_ema", None)
+                        for trainer in trainers
+                    ],
+                    "learning_rates": [
+                        getattr(trainer, "learning_rate", None)
+                        for trainer in trainers
+                    ],
+                    "lr_events": lr_events,
+                })
             if print_progress:
                 if stage_history[-1]["epochs"] != 1:
                     print(CLEAR_PREVIOUS_LINE, end="")
+                validation_note = (
+                    f"validation accuracy {validation_accuracy:.4%}"
+                )
+                if select_by_element_accuracy:
+                    validation_note += (
+                        f", per-bit accuracy {validation_element_accuracy:.4%}"
+                    )
                 print(
                     f"Depth {depth}, trainers {agent_count}, "
                     f"epoch {stage_history[-1]['epochs']}/{epochs}, "
-                    f"validation accuracy {validation_accuracy:.4%}"
+                    f"{validation_note}"
+                    f"{lr_note}"
                 )
 
-            if (
-                validation_accuracy > best_validation_accuracy
-                or (
-                    validation_accuracy == best_validation_accuracy
-                    and validation_element_accuracy
-                    > best_validation_element_accuracy
-                )
-            ):
+            validation_selection_key = _validation_selection_key(
+                family_key,
+                target.response_length,
+                validation_accuracy,
+                validation_element_accuracy,
+            )
+            if validation_selection_key > best_validation_selection_key:
                 import torch
 
                 best_model = build_attack_model(
@@ -809,9 +1085,11 @@ def _attack_one_puf(
                         for trainer_model in selected_trainer_models
                     ],
                     torch.device("cpu"),
+                    response_thresholds=selected_response_thresholds,
                 )
                 best_validation_accuracy = validation_accuracy
                 best_validation_element_accuracy = validation_element_accuracy
+                best_validation_selection_key = validation_selection_key
                 selected_stage = stage_name
                 selected_depth = depth
                 selected_agent_count = len(selected_trainer_models)
@@ -883,6 +1161,11 @@ def _attack_one_puf(
         "agents": selected_agent_count,
         "validation_accuracy": validation_accuracy,
         "validation_element_accuracy": best_validation_element_accuracy,
+        "selection_metric": (
+            "response_element_accuracy"
+            if select_by_element_accuracy
+            else "complete_response_accuracy"
+        ),
         "test_accuracy": test_accuracy,
         "test_element_accuracy": test_element_accuracy,
         "matched_test_responses": int(np.count_nonzero(response_row_matches)),
@@ -983,16 +1266,20 @@ def run_ml_attack_experiment(
     per-depth epoch limit. Auto routing uses logistic regression for Arbiter and selects an XOR
     classifier from the effective chain group size: PyTorch logistic
     regression for one chain per bit, quadratic ATT features for two chains,
-    and the parity-aware XOR neural model for larger groups. Interpose uses
-    FC-BiLSTM. Feed-forward Arbiter and optical PUFs use their structure-aware
-    attacks. Permutation PUFs use chain-specific permuted ATT features and
-    parity-composed Arbiter scores. Ring-oscillator PUFs use per-response-bit
-    logistic regression on raw challenges. Unhashed SRAM responses use direct
-    per-bit logistic regression; hashed SRAM responses use a bounded random
-    fingerprint search.
+    and the parity-aware XOR neural model for larger groups. Interpose auto
+    routing uses a structure-aware linear/logistic model; ``staged_split``
+    alternates upstream and downstream component updates. Feed-forward
+    Arbiter PUFs use the structure-aware deep neural attack. Optical PUFs use
+    their structure-aware attacks. Permutation PUFs use chain-specific
+    permuted ATT features and parity-composed Arbiter scores.
+    Ring-oscillator PUFs use per-response-bit logistic regression on raw
+    challenges. Unhashed SRAM responses use direct per-bit logistic
+    regression; hashed SRAM responses use a bounded random fingerprint search.
     Explicit ``neural`` or ``svm`` selection overrides these choices except
-    for optical PUFs. An instance counts as matched when held-out test accuracy
-    reaches ``success_threshold``.
+    for optical PUFs. ``deep_neural`` selects a structure-aware PyTorch DNN
+    for feed-forward Arbiter, XOR Arbiter, Interpose, and Permutation PUFs.
+    ``staged_split`` is limited to Interpose PUFs. An instance counts as
+    matched when held-out test accuracy reaches ``success_threshold``.
     """
     selected_families = tuple(
         DEFAULT_ATTACK_FAMILIES if families is None else families
@@ -1000,8 +1287,17 @@ def run_ml_attack_experiment(
     if not selected_families:
         raise ValueError("At least one PUF family is required.")
     attack_model = attack_model.strip().lower()
-    if attack_model not in {"auto", "neural", "svm"}:
-        raise ValueError("attack_model must be 'auto', 'neural', or 'svm'.")
+    if attack_model not in {
+        "auto",
+        "neural",
+        "svm",
+        "deep_neural",
+        "staged_split",
+    }:
+        raise ValueError(
+            "attack_model must be 'auto', 'neural', 'svm', 'deep_neural', "
+            "or 'staged_split'."
+        )
     normalized_backend = backend.strip().lower()
     normalized_family_keys = {
         family: _normalize_family_key(family) for family in selected_families
@@ -1013,6 +1309,13 @@ def run_ml_attack_experiment(
     ]
     if unknown:
         raise ValueError(f"Unknown PUF families: {', '.join(unknown)}")
+    if attack_model == "staged_split" and any(
+        family_key != "interpose"
+        for family_key in normalized_family_keys.values()
+    ):
+        raise ValueError(
+            "attack_model='staged_split' is only supported for the interpose family."
+        )
     attack_model_by_family = {
         family: _resolve_attack_model_for_family(
             family_key,
@@ -1024,6 +1327,18 @@ def run_ml_attack_experiment(
         )
         for family, family_key in normalized_family_keys.items()
     }
+    if attack_model == "deep_neural":
+        unsupported_families = [
+            family
+            for family, family_key in normalized_family_keys.items()
+            if family_key not in _arbiter.deep_neural.SUPPORTED_FAMILIES
+        ]
+        if unsupported_families:
+            raise ValueError(
+                "attack_model='deep_neural' supports only ff_apuf, xor_apuf, "
+                "interpose, and permutation; unsupported families: "
+                + ", ".join(unsupported_families)
+            )
     uses_svm = any(
         family_attack_model == "svm"
         for family_attack_model in attack_model_by_family.values()
