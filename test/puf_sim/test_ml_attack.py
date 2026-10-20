@@ -1,10 +1,16 @@
 import csv
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 
 import puf_sim.puf_ml_attack.experiment as experiment
+from puf_sim.puf_ml_attack.unknown import (
+    _split_indices,
+    generate_crps,
+    run_attack_unknown_puf,
+)
 from puf_sim.puf_ml_attack.experiment import _pair_accuracy
 from puf_sim.puf_ml_attack.arbiter.xor_apuf import (
     AgentTrainer as XorAgentTrainer,
@@ -1932,6 +1938,7 @@ def test_train_until_threshold_reports_effort(monkeypatch, capsys):
     )
 
     output = capsys.readouterr().out
+    assert output.count(experiment.CLEAR_LINE) == 3
     assert result["threshold_reached"] is True
     assert result["epochs_to_threshold"] == 3
     assert result["epochs_trained"] == 3
@@ -2348,3 +2355,296 @@ def test_report_layout_includes_response_comparisons(tmp_path):
         "1", "0", "1", "0", "1",
     ]
     assert response_rows[2][-1] == "0"
+
+
+def test_unknown_crps_are_grouped_by_blinded_instance(tmp_path):
+    dataset_directory = generate_crps(
+        {"xor_apuf": 1, "arbiter": 1},
+        n=8,
+        total_samples=40,
+        k=2,
+        seed=45,
+        data_root=tmp_path,
+        dataset_name="blinded",
+    )
+
+    with (dataset_directory / "manifest.json").open(encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    assert manifest["instance_count"] == 2
+    assert manifest["total_samples"] == 40
+    assert [instance["instance_id"] for instance in manifest["instances"]] == [
+        "instance_0001",
+        "instance_0002",
+    ]
+    assert all("family" not in instance for instance in manifest["instances"])
+    for instance in manifest["instances"]:
+        with np.load(dataset_directory / instance["file"]) as arrays:
+            assert arrays["challenges"].shape == (20, 8)
+            assert arrays["responses"].shape == (20, 1)
+
+
+def test_unknown_bagging_runs_candidates_and_saves_best_reports(tmp_path):
+    dataset_directory = generate_crps(
+        {"arbiter": 1},
+        n=8,
+        samples_per_instance=40,
+        seed=46,
+        data_root=tmp_path,
+        dataset_name="attack-data",
+    )
+    result = run_attack_unknown_puf(
+        dataset_directory,
+        bagging_runs=2,
+        seed=47,
+        candidate_families=["arbiter"],
+        attack_models=["linear_logits"],
+        epochs=1,
+        batch_size=8,
+        max_depth=1,
+        backend="cpu",
+        report_root=tmp_path / "reports",
+    )
+
+    instance = result["instances"][0]
+    assert len(instance["trials"]) == 2
+    assert instance["best_validation_selected"]["model_type"] == "linear_logits"
+    assert instance["best_test_oracle"]["model_type"] == "linear_logits"
+    report_directory = Path(result["report_directory"])
+    assert (report_directory / "responses.csv").is_file()
+    assert (report_directory / "responses_validation_selected.csv").is_file()
+    with (report_directory / "responses.csv").open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        response_rows = list(csv.DictReader(handle))
+    assert response_rows
+    assert response_rows[0]["instance_id"] == "instance_0001"
+    assert response_rows[0]["model_type"] == "linear_logits"
+    assert response_rows[0]["selection_basis"] == "best_test_oracle"
+
+
+def test_unknown_auto_candidates_use_the_family_router(tmp_path):
+    dataset_directory = generate_crps(
+        {"arbiter": 1},
+        n=8,
+        samples_per_instance=40,
+        seed=49,
+        data_root=tmp_path,
+        dataset_name="auto-data",
+    )
+    result = run_attack_unknown_puf(
+        dataset_directory,
+        bagging_runs=1,
+        seed=50,
+        attack_models=["auto"],
+        epochs=1,
+        batch_size=8,
+        backend="cpu",
+        report_root=tmp_path / "reports",
+    )
+
+    assert any(
+        trial["family_hypothesis"] == "arbiter"
+        and trial["model_type"] == "logistic_regression"
+        for trial in result["instances"][0]["trials"]
+    )
+    assert "arbiter" in result["auto_selected_attack_to_families"][
+        "logistic_regression"
+    ]
+    assert any(
+        candidate["family_hypothesis"] == "permutation"
+        for candidate in result["instances"][0]["skipped_candidates"]
+    )
+
+
+def test_unknown_linear_logits_candidate_works_for_xor_family(tmp_path):
+    dataset_directory = generate_crps(
+        {"xor_apuf": 1},
+        n=8,
+        samples_per_instance=80,
+        seed=56,
+        data_root=tmp_path,
+        dataset_name="xor-linear-data",
+    )
+    result = run_attack_unknown_puf(
+        dataset_directory,
+        bagging_runs=1,
+        seed=57,
+        candidate_families=["xor_apuf"],
+        epochs=1,
+        batch_size=16,
+        backend="cpu",
+        report_root=tmp_path / "reports",
+    )
+
+    tested_models = {
+        trial["model_type"] for trial in result["instances"][0]["trials"]
+    }
+    assert tested_models == {
+        "linear_logits",
+        "neural",
+        "svm",
+        "fc_lstm",
+        "xor_rank_two",
+        "deep_neural",
+        "xor_quadratic",
+    }
+
+
+def test_unknown_runner_passes_torch_xpu_backend_to_attack(monkeypatch, tmp_path):
+    dataset_directory = generate_crps(
+        {"arbiter": 1},
+        n=8,
+        samples_per_instance=40,
+        seed=58,
+        data_root=tmp_path,
+        dataset_name="xpu-data",
+    )
+    xpu_device = SimpleNamespace(type="xpu")
+    resolved_backends = []
+
+    def resolve_device(backend, device):
+        resolved_backends.append((backend, device))
+        return xpu_device
+
+    def attack_with_fake_device(*args, **kwargs):
+        assert args[13] is xpu_device
+        training, validation, test = kwargs["crp_splits"]
+        test_responses = np.asarray(test.responses).reshape(
+            len(test.challenges), -1
+        )
+        matches = np.ones(len(test.challenges), dtype=bool)
+        sample_counts = (len(training.challenges), len(validation.challenges),
+                         len(test.challenges))
+        return {
+            "attack": "linear_logits",
+            "depth": 0,
+            "validation_accuracy": 1.0,
+            "validation_element_accuracy": 1.0,
+            "test_accuracy": 1.0,
+            "test_element_accuracy": 1.0,
+            "training_samples": sample_counts[0],
+            "validation_samples": sample_counts[1],
+            "test_samples": sample_counts[2],
+            "epochs_trained": 0,
+            "fit_elapsed_seconds": 0.0,
+            "_response_rows": (
+                (test_responses > 0).astype(np.uint8),
+                (test_responses > 0).astype(np.uint8),
+                matches,
+            ),
+        }
+
+    monkeypatch.setattr(experiment, "_resolve_device", resolve_device)
+    monkeypatch.setattr(experiment, "_attack_one_puf", attack_with_fake_device)
+    run_attack_unknown_puf(
+        dataset_directory,
+        bagging_runs=1,
+        candidate_families=["arbiter"],
+        attack_models=["linear_logits"],
+        backend="torch_xpu",
+        device=0,
+        report_root=tmp_path / "reports",
+    )
+
+    assert resolved_backends == [("torch_xpu", 0)]
+
+
+def test_unknown_runner_reports_incompatible_family_hypotheses(tmp_path):
+    dataset_directory = generate_crps(
+        {"arbiter": 1},
+        n=8,
+        samples_per_instance=40,
+        seed=54,
+        data_root=tmp_path,
+        dataset_name="incompatible-hypothesis",
+    )
+    result = run_attack_unknown_puf(
+        dataset_directory,
+        bagging_runs=1,
+        seed=55,
+        candidate_families=["arbiter", "permutation"],
+        attack_models=["auto"],
+        epochs=1,
+        backend="cpu",
+        report_root=tmp_path / "reports",
+    )
+
+    skipped = result["instances"][0]["skipped_candidates"]
+    assert len(skipped) == 1
+    assert skipped[0]["family_hypothesis"] == "permutation"
+    assert "not supported for n=8" in skipped[0]["reason"]
+
+
+def test_unknown_continuous_crps_use_optical_compatible_models(tmp_path):
+    dataset_directory = generate_crps(
+        {"optical": 1},
+        n=8,
+        samples_per_instance=60,
+        seed=52,
+        data_root=tmp_path,
+        dataset_name="optical-data",
+    )
+    result = run_attack_unknown_puf(
+        dataset_directory,
+        bagging_runs=1,
+        seed=53,
+        candidate_families=["optical"],
+        attack_models=["auto"],
+        epochs=1,
+        batch_size=16,
+        backend="cpu",
+        report_root=tmp_path / "reports",
+    )
+
+    assert result["instances"][0]["trials"][0]["model_type"] == (
+        "optical_regression"
+    )
+    assert result["model_to_compatible_family_hypotheses"] == {
+        "optical_regression": ["optical"]
+    }
+
+
+def test_linear_logits_is_available_in_known_family_experiment():
+    result = experiment.run_ml_attack_experiment(
+        families=["arbiter"],
+        n=8,
+        training_samples=32,
+        validation_samples=16,
+        test_samples=16,
+        seed=51,
+        max_depth=1,
+        agents=1,
+        epochs=1,
+        batch_size=8,
+        backend="cpu",
+        attack_model="linear_logits",
+        save_report=False,
+        puf_instances=1,
+    )["arbiter"]["instances"][0]
+
+    assert result["model_architecture"] == "linear_logits"
+    assert result["depth"] == 0
+    assert result["activation_types"]["hidden_layers"] == []
+    assert result["activation_types"]["output_layer"] == "Linear logits"
+
+
+def test_unknown_split_keeps_repeated_challenges_together():
+    challenges = np.asarray(
+        [
+            [1, -1], [1, -1], [1, -1], [1, -1],
+            [-1, 1], [-1, 1], [-1, 1], [-1, 1],
+            [1, 1], [1, 1], [1, 1], [1, 1],
+        ],
+        dtype=np.int8,
+    )
+    splits = _split_indices(challenges, seed=48)
+
+    split_challenges = [
+        {tuple(row) for row in challenges[indices]}
+        for indices in splits
+    ]
+    assert all(
+        split_challenges[left].isdisjoint(split_challenges[right])
+        for left in range(3)
+        for right in range(left + 1, 3)
+    )

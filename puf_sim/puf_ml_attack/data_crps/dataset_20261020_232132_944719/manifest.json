@@ -1,0 +1,153 @@
+{
+  "format_version": 1,
+  "dataset_id": "dataset_20261020_232132_944719",
+  "instance_count": 20,
+  "total_samples": 40000,
+  "seed": 20261020,
+  "n": 64,
+  "k": 2,
+  "response_bits": 10,
+  "noisiness": 0.0,
+  "instances": [
+    {
+      "instance_id": "instance_0001",
+      "file": "instance_0001.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0002",
+      "file": "instance_0002.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0003",
+      "file": "instance_0003.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0004",
+      "file": "instance_0004.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0005",
+      "file": "instance_0005.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0006",
+      "file": "instance_0006.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0007",
+      "file": "instance_0007.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0008",
+      "file": "instance_0008.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0009",
+      "file": "instance_0009.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0010",
+      "file": "instance_0010.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0011",
+      "file": "instance_0011.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0012",
+      "file": "instance_0012.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0013",
+      "file": "instance_0013.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0014",
+      "file": "instance_0014.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0015",
+      "file": "instance_0015.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0016",
+      "file": "instance_0016.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0017",
+      "file": "instance_0017.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0018",
+      "file": "instance_0018.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0019",
+      "file": "instance_0019.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    },
+    {
+      "instance_id": "instance_0020",
+      "file": "instance_0020.npz",
+      "sample_count": 2000,
+      "challenge_length": 64,
+      "response_length": 10
+    }
+  ]
+}

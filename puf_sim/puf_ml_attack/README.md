@@ -12,9 +12,12 @@ When `families=None`, the experiment attacks `optical`, `arbiter`, `ff_apuf`,
 
 ## Model catalog and routing
 
-The experiment supports four top-level `attack_model` values:
+The experiment supports the following top-level `attack_model` values:
 
 - `"auto"`: family-aware default routing.
+- `"linear_logits"`: a raw-challenge, no-hidden-layer PyTorch baseline trained
+  with binary cross-entropy and Adam (optical PUFs remain on their regression
+  route).
 - `"neural"`: family-routed neural path (non-optical families).
 - `"svm"`: SVM route for supported non-optical families.
 - `"deep_neural"`: structure-aware PyTorch DNN for `ff_apuf`, `xor_apuf`,
@@ -311,6 +314,89 @@ test rows; their ratio is the reported `test_accuracy`.
 `test_element_accuracy` measures the fraction of individual response bits
 (pixels for optical PUFs) that match, independently of whether the rest of the
 response row matches.
+
+## Unknown-family CRP search
+
+`generate_crps()` creates one compressed `.npz` file per PUF instance under
+`puf_ml_attack/data_crps/` by default. Instance IDs are stable within the
+dataset (`instance_0001`, `instance_0002`, ...), and each file contains all
+CRPs for that one PUF. The manifest records dimensions and sample counts but
+does not disclose the generating family. Set exactly one of
+`samples_per_instance` or `total_samples`; the latter is distributed as evenly
+as possible across instances.
+
+Run this from the repository root with the project Python environment:
+
+```python
+from puf_sim.puf_ml_attack import generate_crps, run_attack_unknown_puf
+
+dataset_directory = generate_crps(
+    family_instance_counts={
+        "xor_apuf": 1,
+        "arbiter": 1,
+    },
+    n=64,
+    samples_per_instance=2_000,  # 2,000 CRPs per PUF instance
+    # Alternatively, use total_samples=4_000 instead of samples_per_instance.
+    k=2,
+    response_bits=1,
+    noisiness=0.0,
+    seed=23,
+)
+print(f"CRPs saved to: {dataset_directory}")
+
+report = run_attack_unknown_puf(
+    dataset_path=dataset_directory,
+    bagging_runs=2,  # two different 70/20/10 splits of each instance's CRPs
+    seed=24,
+    k=2,
+    max_depth=2,
+    agents=1,
+    epochs=10,
+    batch_size=256,
+    backend="cpu",
+    print_progress=True,
+)
+
+for instance in report["instances"]:
+    best = instance["best_validation_selected"]
+    print(
+        instance["instance_id"],
+        best["family_hypothesis"],
+        best["model_type"],
+        f"mean validation accuracy: "
+        f"{best['mean_validation_accuracy']:.2%}",
+        f"selected run test accuracy: {best['test_accuracy']:.2%}",
+    )
+print(f"Report saved to: {report['report_directory']}")
+```
+
+On a machine with a supported Intel XPU and PyTorch XPU support, use
+`backend="torch_xpu", device=0` instead of `backend="cpu"`.
+
+By default, the runner tests all supported family hypotheses and compatible
+attack models; neither `candidate_families` nor `attack_models` needs to be
+passed. Both are optional filters for smaller searches. The full search can
+take substantially longer; reduce `samples_per_instance`, `bagging_runs`,
+`max_depth`, or `epochs` for an initial smoke run.
+
+`run_attack_unknown_puf()` treats each CRP file as an opaque instance and
+compares supported model/family hypotheses using repeated, seeded 70/20/10
+splits. Candidate models share each split; repeated runs use different
+allocations. Duplicate challenges are kept within one partition to prevent
+challenge leakage, so split sizes can differ slightly from the requested
+ratios when the dataset contains repeated challenges. Candidate-family names
+are hypotheses, not labels read from the data.
+
+The report includes the family-to-auto-route reverse map, compatible family
+hypotheses, per-candidate scores, and both a validation-selected response file
+and `responses.csv` for the highest-test-scoring (test-oracle) candidate. Since
+the latter is chosen using test responses, its score is not an unbiased
+generalization estimate; use the validation-selected result for that purpose.
+`attack_models` can restrict candidates, and `candidate_families` can restrict
+the structural hypotheses when a smaller search is desired. For structural
+assumptions such as feed-forward loop locations or the Interpose bit position,
+pass per-family values through `family_options`.
 
 ## Command line
 

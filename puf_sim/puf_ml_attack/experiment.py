@@ -47,6 +47,7 @@ DEFAULT_ATTACK_FAMILIES = (
 )
 
 CLEAR_PREVIOUS_LINE = "\033[1A\x1b[2K"
+CLEAR_LINE = "\r\033[2K"
 MODEL_SCREENING_EPOCHS = 10
 MODEL_SCREENING_THRESHOLD = 0.5
 
@@ -244,6 +245,15 @@ def _activation_profile(family_key: str, depth: int) -> Dict[str, Any]:
 def _model_profile(
     family_key: str, depth: int, attack_model: str, device: Any = None
 ) -> Dict[str, Any]:
+    if attack_model == "linear_logits":
+        return {
+            "feature_mapping": ["Raw challenge bits"],
+            "estimator": "PyTorch linear logits",
+            "hidden_layers": [],
+            "internal_layers": [],
+            "output_layer": "Linear logits",
+            "prediction": "Bipolar threshold",
+        }
     if attack_model == "logistic_regression":
         return {
             "feature_mapping": ["Arbiter Threshold Transform"],
@@ -465,12 +475,22 @@ def _attack_one_puf(
     family: str,
     print_progress: bool = False,
     attack_model: str = "neural",
+    crp_splits: Optional[
+        tuple[ChallengeResponseSet, ChallengeResponseSet, ChallengeResponseSet]
+    ] = None,
 ) -> Dict[str, Any]:
-    training = ChallengeResponseSet.from_simulation(target, N=training_samples, seed=seed)
-    validation = ChallengeResponseSet.from_simulation(
-        target, N=validation_samples, seed=seed + 1
-    )    
-    test = ChallengeResponseSet.from_simulation(target, N=test_samples, seed=seed + 2)
+    if crp_splits is None:
+        training = ChallengeResponseSet.from_simulation(
+            target, N=training_samples, seed=seed
+        )
+        validation = ChallengeResponseSet.from_simulation(
+            target, N=validation_samples, seed=seed + 1
+        )
+        test = ChallengeResponseSet.from_simulation(
+            target, N=test_samples, seed=seed + 2
+        )
+    else:
+        training, validation, test = crp_splits
     hidden_width = width or max(16, 2 * n)
     best_model: Optional[Simulation] = None
     best_validation_accuracy = -1.0
@@ -507,7 +527,12 @@ def _attack_one_puf(
             )
         feed_forward_loop = tuple(feed_forward_loops[0])
 
-    if attack_model in {"fc_lstm", "ff_fc_lstm"}:
+    if attack_model == "linear_logits":
+        trainer_type = _AgentTrainer
+        model_type = _TorchPUFModel
+        stage_name = "linear_logits"
+        pair_accuracy_fn = _pair_accuracy
+    elif attack_model in {"fc_lstm", "ff_fc_lstm"}:
         trainer_type = _fc_lstm.AgentTrainer
         model_type = _fc_lstm.TorchFCBiLSTMModel
         stage_name = (
@@ -814,6 +839,7 @@ def _attack_one_puf(
             )
         stages = []
     elif attack_model in {
+        "linear_logits",
         "xor_logistic_regression",
         "xor_quadratic",
         "xor_rank_two",
@@ -898,7 +924,10 @@ def _attack_one_puf(
                 ))
             elif attack_model == "fc_lstm":
                 trainers.append(trainer_type(*trainer_arguments))
-            elif family_key in {"xor_apuf", "xor_arbiter"}:
+            elif (
+                family_key in {"xor_apuf", "xor_arbiter"}
+                and attack_model == "neural"
+            ):
                 trainers.append(trainer_type(*trainer_arguments, chain_count=target.k))
             elif family_key == "interpose":
                 trainers.append(trainer_type(
@@ -1054,8 +1083,7 @@ def _attack_one_puf(
                     "lr_events": lr_events,
                 })
             if print_progress:
-                if stage_history[-1]["epochs"] != 1:
-                    print(CLEAR_PREVIOUS_LINE, end="")
+                print(CLEAR_LINE, end="", flush=True)
                 validation_note = (
                     f"validation accuracy {validation_accuracy:.4%}"
                 )
@@ -1063,11 +1091,14 @@ def _attack_one_puf(
                     validation_note += (
                         f", per-bit accuracy {validation_element_accuracy:.4%}"
                     )
+                
                 print(
                     f"Depth {depth}, trainers {agent_count}, "
                     f"epoch {stage_history[-1]['epochs']}/{epochs}, "
                     f"{validation_note}"
-                    f"{lr_note}"
+                    f"{lr_note}",
+                    end="",
+                    flush=True,
                 )
 
             validation_selection_key = _validation_selection_key(
@@ -1098,7 +1129,7 @@ def _attack_one_puf(
                 threshold_reached = True
                 if print_progress:
                     print(
-                        "Success threshold reached with validation accuracy "
+                        "\nSuccess threshold reached with validation accuracy "
                         f"{validation_accuracy:.4%}"
                     )
                 break
@@ -1113,12 +1144,12 @@ def _attack_one_puf(
                     f"within the first {MODEL_SCREENING_EPOCHS} epochs."
                 )
                 if print_progress:
-                    print(early_stop_reason + " Stopping this model.")
+                    print("\n" + early_stop_reason + " Stopping this model.")
                 break
             if stage_history[-1]["epochs"] >= epochs:
                 if print_progress:
                     print(
-                        f"Maximum epochs reached for depth {depth} with validation "
+                        f"\nMaximum epochs reached for depth {depth} with validation "
                         f"accuracy {validation_accuracy:.4%}"
                     )
                 break
@@ -1275,9 +1306,10 @@ def run_ml_attack_experiment(
     Ring-oscillator PUFs use per-response-bit logistic regression on raw
     challenges. Unhashed SRAM responses use direct per-bit logistic
     regression; hashed SRAM responses use a bounded random fingerprint search.
-    Explicit ``neural`` or ``svm`` selection overrides these choices except
-    for optical PUFs. ``deep_neural`` selects a structure-aware PyTorch DNN
-    for feed-forward Arbiter, XOR Arbiter, Interpose, and Permutation PUFs.
+    Explicit ``linear_logits``, ``neural``, or ``svm`` selection overrides
+    these choices except for optical PUFs. ``deep_neural`` selects a
+    structure-aware PyTorch DNN for feed-forward Arbiter, XOR Arbiter,
+    Interpose, and Permutation PUFs.
     ``staged_split`` is limited to Interpose PUFs. An instance counts as
     matched when held-out test accuracy reaches ``success_threshold``.
     """
@@ -1289,13 +1321,14 @@ def run_ml_attack_experiment(
     attack_model = attack_model.strip().lower()
     if attack_model not in {
         "auto",
+        "linear_logits",
         "neural",
         "svm",
         "deep_neural",
         "staged_split",
     }:
         raise ValueError(
-            "attack_model must be 'auto', 'neural', 'svm', 'deep_neural', "
+            "attack_model must be 'auto', 'linear_logits', 'neural', 'svm', 'deep_neural', "
             "or 'staged_split'."
         )
     normalized_backend = backend.strip().lower()
