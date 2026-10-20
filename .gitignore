@@ -150,3 +150,7 @@ scratch/
 # Generated machine-learning attack reports
 /puf_sim/reports_ml_attacks/*
 !/puf_sim/reports_ml_attacks/README.md
+
+# Generated CRP datasets
+/puf_sim/puf_ml_attack/data_crps/*
+!/puf_sim/puf_ml_attack/data_crps/.gitkeep
