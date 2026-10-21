@@ -373,12 +373,39 @@ print(f"Report saved to: {report['report_directory']}")
 
 On a machine with a supported Intel XPU and PyTorch XPU support, use
 `backend="torch_xpu", device=0` instead of `backend="cpu"`.
+If an XPU candidate raises `UR_RESULT_ERROR_OUT_OF_RESOURCES`, the runner
+retries that candidate with successively halved batch sizes down to 1, clearing
+unused XPU cache between attempts. Other runtime errors are raised unchanged.
+The successful `effective_batch_size` is recorded for each candidate in
+`results.json` and in both response CSV files.
 
 By default, the runner tests all supported family hypotheses and compatible
-attack models; neither `candidate_families` nor `attack_models` needs to be
-passed. Both are optional filters for smaller searches. The full search can
-take substantially longer; reduce `samples_per_instance`, `bagging_runs`,
-`max_depth`, or `epochs` for an initial smoke run.
+attack models; candidate filters are optional. `candidate_families` or
+`family_hypothesis` limits the family hypotheses, `attack_models` applies a
+global model filter, and `candidate_model_types` applies model filters by
+family. If none are supplied, the existing full trial sequence is used. The
+full search can take substantially longer; reduce `samples_per_instance`,
+`bagging_runs`, `max_depth`, or `epochs` for an initial smoke run.
+
+`family_hypothesis` can select one or more families to test and is an alias for
+the existing `candidate_families` argument; specify only one of them.
+`candidate_model_types` can then restrict model types by family:
+
+```python
+report = run_attack_unknown_puf(
+    dataset_path,
+    family_hypothesis=["arbiter", "xor_apuf"],
+    candidate_model_types={
+        "arbiter": ["linear_logits", "neural"],
+        "xor_apuf": ["linear_logits", "deep_neural"],
+    },
+)
+```
+
+Each map value can be a single model type or a sequence. A family omitted from
+the map keeps its existing candidate sequence; `attack_models`, if supplied,
+continues to act as an additional global filter. If neither new argument is
+provided, the existing default family/model trial sequence is unchanged.
 
 `run_attack_unknown_puf()` treats each CRP file as an opaque instance and
 compares supported model/family hypotheses using repeated, seeded 70/20/10
@@ -387,12 +414,39 @@ allocations. Duplicate challenges are kept within one partition to prevent
 challenge leakage, so split sizes can differ slightly from the requested
 ratios when the dataset contains repeated challenges. Candidate-family names
 are hypotheses, not labels read from the data.
+With `print_progress=True`, each candidate's family hypothesis and model type
+are printed before training; its resolved architecture and attack stage are
+printed when it completes, along with its trial lap time and elapsed time
+since the runner started.
+
+Unknown-PUF candidates use reference screening gates at epochs 30/50/80/100
+with validation thresholds of 0%/50%/90%/92%. These correspond to 15%, 25%,
+40%, and 50% of the 200-epoch reference cap. The actual gate is the later of
+its reference epoch or its proportional position for the selected epoch cap.
+Thus caps up to 200 keep the gates at 30/50/80/100; `epochs=150` leaves 50
+epochs after the last gate. Larger caps scale the gates proportionally, rounding
+up; for example, `epochs=500` checks at 75/125/200/250. Gates later than the
+epoch cap are not reached. A depth that fails a gate is excluded, but other
+depths for the same candidate are still attempted. Reaching
+`success_threshold` on complete-response validation stops that candidate at
+its current depth and skips its later depths; other attack candidates still
+run so they can be compared. For example, `success_threshold=0.99` with
+`max_total_epochs=300` lets a candidate stop as soon as its validation accuracy
+reaches 99%, rather than using all 300 epochs.
+`max_total_epochs` sets this per-depth cap and defaults to 200; the legacy
+`epochs` argument remains an alias. Specify only one of the two.
 
 The report includes the family-to-auto-route reverse map, compatible family
 hypotheses, per-candidate scores, and both a validation-selected response file
 and `responses.csv` for the highest-test-scoring (test-oracle) candidate. Since
 the latter is chosen using test responses, its score is not an unbiased
 generalization estimate; use the validation-selected result for that purpose.
+`results.json` is refreshed after each instance completes. Its leading
+`best_guessed_model` summary ranks family/model candidates by mean test accuracy
+across successful bagged trials (averaging instances equally), and records the
+mean and cumulative trial time for that candidate. Each trial also records its
+lap time and total run elapsed time; `overall_summary` includes the timer start
+and elapsed time for the whole run.
 `attack_models` can restrict candidates, and `candidate_families` can restrict
 the structural hypotheses when a smaller search is desired. For structural
 assumptions such as feed-forward loop locations or the Interpose bit position,

@@ -4,8 +4,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 import puf_sim.puf_ml_attack.experiment as experiment
+import puf_sim.puf_ml_attack.unknown as unknown_attack
 from puf_sim.puf_ml_attack.unknown import (
     _split_indices,
     generate_crps,
@@ -898,7 +900,7 @@ def test_auto_uses_sram_logistic_model_for_unhashed_responses(tmp_path):
     assert parameters["hash_responses"] is False
 
 
-def test_auto_uses_arbiter_logistic_for_single_chain_xor_outputs():
+def test_auto_uses_arbiter_logistic_for_single_chain_xor_outputs(capsys):
     result = experiment.run_ml_attack_experiment(
         families=["xor_apuf"],
         n=8,
@@ -918,8 +920,18 @@ def test_auto_uses_arbiter_logistic_for_single_chain_xor_outputs():
         save_report=False,
         puf_instances=1,
         attack_model="auto",
+        print_progress=True,
     )["xor_apuf"]["instances"][0]
 
+    output = capsys.readouterr().out
+    assert (
+        experiment.CLEAR_LINE
+        + "Depth 0, trainers 1, epoch 1/1, validation accuracy "
+        in output
+    )
+    assert (
+        " | maximum epochs reached" in output
+    )
     assert result["model_architecture"] == "xor_logistic_regression"
     assert result["attack"] == "xor_arbiter_per_bit_logistic_regression"
     assert result["activation_types"]["estimator"] == (
@@ -965,7 +977,7 @@ def test_auto_ff_apuf_experiment_uses_structure_aware_deep_neural(tmp_path):
     assert saved_epoch == epoch
 
 
-def test_auto_interpose_uses_structure_aware_logistic_model():
+def test_auto_interpose_uses_structure_aware_logistic_model(capsys):
     result = experiment.run_ml_attack_experiment(
         families=["interpose"],
         n=8,
@@ -985,8 +997,16 @@ def test_auto_interpose_uses_structure_aware_logistic_model():
         save_report=False,
         puf_instances=1,
         attack_model="auto",
+        print_progress=True,
     )["interpose"]["instances"][0]
 
+    output = capsys.readouterr().out
+    assert (
+        experiment.CLEAR_LINE
+        + "Depth 0, trainers 1, epoch 1/1, validation accuracy "
+        in output
+    )
+    assert " | maximum epochs reached" in output
     assert result["model_architecture"] == "interpose_logistic_regression"
     assert result["attack"] == "interpose_structure_aware_logistic_regression"
     assert result["activation_types"]["hidden_layers"] == []
@@ -1939,6 +1959,11 @@ def test_train_until_threshold_reports_effort(monkeypatch, capsys):
 
     output = capsys.readouterr().out
     assert output.count(experiment.CLEAR_LINE) == 3
+    assert (
+        experiment.CLEAR_LINE
+        + "Depth 1, trainers 1, epoch 3/3, validation accuracy 95.0000% "
+        "| success threshold reached"
+    ) in output
     assert result["threshold_reached"] is True
     assert result["epochs_to_threshold"] == 3
     assert result["epochs_trained"] == 3
@@ -1953,7 +1978,113 @@ def test_train_until_threshold_reports_effort(monkeypatch, capsys):
     assert "epoch 3/3, validation accuracy 95.0000%" in output
 
 
-def test_epoch_limit_applies_at_each_depth(monkeypatch):
+def test_epoch_limit_applies_at_each_depth(monkeypatch, capsys):
+    class DatasetFactory:
+        @staticmethod
+        def from_simulation(target, N, seed):
+            return SimpleNamespace(
+                challenges=np.zeros((N, 1)),
+                responses=np.ones((N, 1)),
+                seed=seed,
+            )
+
+    class AgentTrainer:
+        def __init__(self, *args, **kwargs):
+            self.model = FakeTorchModel(args[3])
+
+        def train_epoch(self):
+            pass
+
+    class AttackModel:
+        def __init__(self, models, n, response_bits, device):
+            self.depth = models[0].depth
+
+        def eval(self, challenges):
+            return np.ones((len(challenges), 1), dtype=np.int8)
+
+    monkeypatch.setattr(experiment, "ChallengeResponseSet", DatasetFactory)
+    monkeypatch.setattr(experiment, "_ArbiterAgentTrainer", AgentTrainer)
+    monkeypatch.setattr(experiment, "_ArbiterTorchPUFModel", AttackModel)
+    monkeypatch.setattr(experiment, "_pair_accuracy", lambda model, dataset: 0.5)
+
+    result = experiment._attack_one_puf(
+        SimpleNamespace(response_length=1),
+        n=1,
+        training_samples=1,
+        validation_samples=1,
+        test_samples=1,
+        seed=10,
+        family="arbiter",
+        success_threshold=1.0,
+        max_depth=2,
+        agents=2,
+        width=None,
+        epochs=3,
+        batch_size=1,
+        learning_rate=0.001,
+        device=SimpleNamespace(type="cpu"),
+        attack_model="neural",
+        print_progress=True,
+    )
+
+    output = capsys.readouterr().out
+    assert (
+        experiment.CLEAR_LINE
+        + "Depth 1, trainers 2, epoch 3/3, validation accuracy 50.0000% "
+        "| maximum epochs reached"
+    ) in output
+    assert (
+        experiment.CLEAR_LINE
+        + "Depth 2, trainers 2, epoch 3/3, validation accuracy 50.0000% "
+        "| maximum epochs reached"
+    ) in output
+    assert [stage["depth"] for stage in result["stages"]] == [1, 2]
+    assert [stage["epochs"] for stage in result["stages"]] == [3, 3]
+    assert result["epochs_trained"] == 6
+    assert result["epochs_per_depth_limit"] == 3
+
+
+def test_progressive_checkpoint_epochs_scale_with_epoch_limit():
+    assert experiment._progressive_validation_checkpoints(200) == {
+        30: (30, 0.0),
+        50: (50, 0.5),
+        80: (80, 0.9),
+        100: (100, 0.92),
+    }
+    assert experiment._progressive_validation_checkpoints(150) == {
+        30: (30, 0.0),
+        50: (50, 0.5),
+        80: (80, 0.9),
+        100: (100, 0.92),
+    }
+    assert experiment._progressive_validation_checkpoints(500) == {
+        75: (30, 0.0),
+        125: (50, 0.5),
+        200: (80, 0.9),
+        250: (100, 0.92),
+    }
+    assert experiment._progressive_validation_checkpoints(1) == {}
+
+
+@pytest.mark.parametrize(
+    (
+        "depth_one_accuracy",
+        "expected_epoch",
+        "expected_gate",
+        "expected_epochs_trained",
+    ),
+    [
+        (0.5, 80, 0.9, 180),
+        (0.0, 30, 0.0, 130),
+    ],
+)
+def test_progressive_screening_excludes_only_the_failed_depth(
+    monkeypatch,
+    depth_one_accuracy,
+    expected_epoch,
+    expected_gate,
+    expected_epochs_trained,
+):
     class DatasetFactory:
         @staticmethod
         def from_simulation(target, N, seed):
@@ -1980,7 +2111,13 @@ def test_epoch_limit_applies_at_each_depth(monkeypatch):
     monkeypatch.setattr(experiment, "ChallengeResponseSet", DatasetFactory)
     monkeypatch.setattr(experiment, "_AgentTrainer", AgentTrainer)
     monkeypatch.setattr(experiment, "_TorchPUFModel", AttackModel)
-    monkeypatch.setattr(experiment, "_pair_accuracy", lambda model, dataset: 0.5)
+    monkeypatch.setattr(
+        experiment,
+        "_pair_accuracy",
+        lambda model, dataset: (
+            depth_one_accuracy if model.depth == 1 else 0.95
+        ),
+    )
 
     result = experiment._attack_one_puf(
         SimpleNamespace(response_length=1),
@@ -1990,20 +2127,91 @@ def test_epoch_limit_applies_at_each_depth(monkeypatch):
         test_samples=1,
         seed=10,
         family="sram",
-        success_threshold=1.0,
+        success_threshold=0.99,
         max_depth=2,
-        agents=2,
+        agents=1,
         width=None,
-        epochs=3,
+        epochs=100,
         batch_size=1,
         learning_rate=0.001,
         device=SimpleNamespace(type="cpu"),
+        progressive_screening=True,
     )
 
-    assert [stage["depth"] for stage in result["stages"]] == [1, 2]
-    assert [stage["epochs"] for stage in result["stages"]] == [3, 3]
-    assert result["epochs_trained"] == 6
-    assert result["epochs_per_depth_limit"] == 3
+    assert [stage["status"] for stage in result["stages"]] == [
+        "excluded",
+        "complete",
+    ]
+    assert result["excluded_depths"] == [{
+        "depth": 1,
+        "epoch": expected_epoch,
+        "reference_gate_epoch": expected_epoch,
+        "validation_accuracy": depth_one_accuracy,
+        "minimum_validation_accuracy": expected_gate,
+    }]
+    assert result["depth"] == 2
+    assert result["candidate_excluded"] is False
+    assert result["epochs_trained"] == expected_epochs_trained
+
+
+def test_progressive_screening_stops_at_user_success_threshold(monkeypatch):
+    class DatasetFactory:
+        @staticmethod
+        def from_simulation(target, N, seed):
+            return SimpleNamespace(
+                challenges=np.zeros((N, 1)),
+                responses=np.ones((N, 1)),
+                seed=seed,
+            )
+
+    class AgentTrainer:
+        def __init__(self, *args, **kwargs):
+            self.model = FakeTorchModel(args[3])
+
+        def train_epoch(self):
+            pass
+
+    class AttackModel:
+        def __init__(self, models, n, response_bits, device):
+            self.depth = models[0].depth
+
+        def eval(self, challenges):
+            return np.ones((len(challenges), 1), dtype=np.int8)
+
+    monkeypatch.setattr(experiment, "ChallengeResponseSet", DatasetFactory)
+    monkeypatch.setattr(experiment, "_AgentTrainer", AgentTrainer)
+    monkeypatch.setattr(experiment, "_TorchPUFModel", AttackModel)
+    monkeypatch.setattr(
+        experiment,
+        "_pair_accuracy",
+        lambda model, dataset: 0.99,
+    )
+
+    result = experiment._attack_one_puf(
+        SimpleNamespace(response_length=1),
+        n=1,
+        training_samples=1,
+        validation_samples=1,
+        test_samples=1,
+        seed=10,
+        family="sram",
+        success_threshold=0.99,
+        max_depth=2,
+        agents=1,
+        width=None,
+        epochs=300,
+        batch_size=1,
+        learning_rate=0.001,
+        device=SimpleNamespace(type="cpu"),
+        progressive_screening=True,
+    )
+
+    assert result["threshold_reached"] is True
+    assert result["validation_accuracy"] == 0.99
+    assert result["depth"] == 1
+    assert result["epochs_trained"] == 1
+    assert [stage["depth"] for stage in result["stages"]] == [1]
+    assert result["epochs_per_depth_limit"] == 300
 
 
 def test_low_element_accuracy_stops_model_after_ten_epochs(monkeypatch):
@@ -2409,6 +2617,17 @@ def test_unknown_bagging_runs_candidates_and_saves_best_reports(tmp_path):
     assert len(instance["trials"]) == 2
     assert instance["best_validation_selected"]["model_type"] == "linear_logits"
     assert instance["best_test_oracle"]["model_type"] == "linear_logits"
+    assert all(
+        trial["trial_elapsed_seconds"] >= 0 for trial in instance["trials"]
+    )
+    assert all(
+        trial["total_elapsed_seconds"] >= trial["trial_elapsed_seconds"]
+        for trial in instance["trials"]
+    )
+    assert result["best_guessed_model"]["model_type"] == "linear_logits"
+    assert result["best_guessed_model"]["mean_test_accuracy"] == pytest.approx(
+        np.mean([trial["test_accuracy"] for trial in instance["trials"]])
+    )
     report_directory = Path(result["report_directory"])
     assert (report_directory / "responses.csv").is_file()
     assert (report_directory / "responses_validation_selected.csv").is_file()
@@ -2419,7 +2638,66 @@ def test_unknown_bagging_runs_candidates_and_saves_best_reports(tmp_path):
     assert response_rows
     assert response_rows[0]["instance_id"] == "instance_0001"
     assert response_rows[0]["model_type"] == "linear_logits"
+    assert response_rows[0]["effective_batch_size"] == "8"
     assert response_rows[0]["selection_basis"] == "best_test_oracle"
+    with (report_directory / "results.json").open(encoding="utf-8") as handle:
+        saved_result = json.load(handle)
+    assert saved_result["best_guessed_model"]["model_type"] == "linear_logits"
+    assert saved_result["overall_summary"]["completed_instances"] == 1
+    assert saved_result["instances"][0]["trials"][0]["trial_elapsed_seconds"] >= 0
+
+
+def test_unknown_report_is_refreshed_after_each_instance(
+    tmp_path, monkeypatch, capsys
+):
+    dataset_directory = generate_crps(
+        {"arbiter": 2},
+        n=8,
+        samples_per_instance=40,
+        seed=56,
+        data_root=tmp_path,
+        dataset_name="incremental-report-data",
+    )
+    report_root = tmp_path / "reports"
+    original_attack = unknown_attack._experiment._attack_one_puf
+    attack_calls = 0
+
+    def check_report_before_next_instance(*args, **kwargs):
+        nonlocal attack_calls
+        if attack_calls == 1:
+            report_path = next(report_root.rglob("results.json"))
+            with report_path.open(encoding="utf-8") as handle:
+                saved_result = json.load(handle)
+            assert saved_result["overall_summary"]["completed_instances"] == 1
+            assert saved_result["instances"][0]["instance_id"] == "instance_0001"
+        attack_calls += 1
+        return original_attack(*args, **kwargs)
+
+    monkeypatch.setattr(
+        unknown_attack._experiment,
+        "_attack_one_puf",
+        check_report_before_next_instance,
+    )
+    result = run_attack_unknown_puf(
+        dataset_directory,
+        bagging_runs=1,
+        seed=57,
+        candidate_families=["arbiter"],
+        attack_models=["linear_logits"],
+        epochs=1,
+        batch_size=8,
+        max_depth=1,
+        backend="cpu",
+        report_root=report_root,
+        print_progress=True,
+    )
+
+    assert attack_calls == 2
+    output = capsys.readouterr().out
+    assert "Timer started at " in output
+    assert "lap_elapsed=" in output
+    assert "total_elapsed=" in output
+    assert result["overall_summary"]["completed_instances"] == 2
 
 
 def test_unknown_auto_candidates_use_the_family_router(tmp_path):
@@ -2456,6 +2734,49 @@ def test_unknown_auto_candidates_use_the_family_router(tmp_path):
     )
 
 
+def test_unknown_family_hypothesis_can_select_models_per_family(tmp_path):
+    dataset_directory = generate_crps(
+        {"arbiter": 1},
+        n=8,
+        samples_per_instance=40,
+        seed=58,
+        data_root=tmp_path,
+        dataset_name="per-family-models",
+    )
+    result = run_attack_unknown_puf(
+        dataset_directory,
+        bagging_runs=1,
+        seed=59,
+        family_hypothesis=["arbiter", "xor_apuf"],
+        candidate_model_types={
+            "arbiter": "linear_logits",
+            "xor_apuf": ["linear_logits"],
+        },
+        epochs=1,
+        batch_size=8,
+        max_depth=1,
+        backend="cpu",
+        report_root=tmp_path / "reports",
+    )
+
+    trials = result["instances"][0]["trials"]
+    assert {
+        (trial["family_hypothesis"], trial["model_type"])
+        for trial in trials
+    } == {
+        ("arbiter", "linear_logits"),
+        ("xor_apuf", "linear_logits"),
+    }
+    report_path = Path(result["report_directory"]) / "parameters.json"
+    with report_path.open(encoding="utf-8") as handle:
+        parameters = json.load(handle)
+    assert parameters["family_hypothesis"] == ["arbiter", "xor_apuf"]
+    assert parameters["candidate_model_types"] == {
+        "arbiter": ["linear_logits"],
+        "xor_apuf": ["linear_logits"],
+    }
+
+
 def test_unknown_linear_logits_candidate_works_for_xor_family(tmp_path):
     dataset_directory = generate_crps(
         {"xor_apuf": 1},
@@ -2488,6 +2809,65 @@ def test_unknown_linear_logits_candidate_works_for_xor_family(tmp_path):
         "deep_neural",
         "xor_quadratic",
     }
+
+
+def test_unknown_linear_logits_candidate_works_for_interpose_family(
+    tmp_path, capsys
+):
+    dataset_directory = generate_crps(
+        {"interpose": 1},
+        n=8,
+        samples_per_instance=80,
+        seed=59,
+        data_root=tmp_path,
+        dataset_name="interpose-linear-data",
+    )
+    result = run_attack_unknown_puf(
+        dataset_directory,
+        bagging_runs=1,
+        seed=60,
+        candidate_families=["interpose"],
+        attack_models=["linear_logits"],
+        epochs=1,
+        batch_size=16,
+        backend="cpu",
+        report_root=tmp_path / "reports",
+        print_progress=True,
+    )
+
+    assert result["instances"][0]["trials"][0]["model_type"] == "linear_logits"
+    assert (
+        experiment.CLEAR_LINE
+        + "Depth 0, trainers 1, epoch 1/1, validation accuracy "
+        in capsys.readouterr().out
+    )
+
+
+def test_unknown_fc_lstm_candidates_use_positive_depth_for_linear_families(tmp_path):
+    dataset_directory = generate_crps(
+        {"arbiter": 1},
+        n=8,
+        samples_per_instance=40,
+        seed=61,
+        data_root=tmp_path,
+        dataset_name="fc-lstm-data",
+    )
+
+    for family in ("ring_oscillator", "memristive"):
+        result = run_attack_unknown_puf(
+            dataset_directory,
+            bagging_runs=1,
+            seed=62,
+            candidate_families=[family],
+            attack_models=["fc_lstm"],
+            max_depth=1,
+            epochs=1,
+            batch_size=8,
+            backend="cpu",
+            report_root=tmp_path / f"reports-{family}",
+        )
+
+        assert result["instances"][0]["trials"][0]["depth"] == 1
 
 
 def test_unknown_runner_passes_torch_xpu_backend_to_attack(monkeypatch, tmp_path):
@@ -2547,6 +2927,113 @@ def test_unknown_runner_passes_torch_xpu_backend_to_attack(monkeypatch, tmp_path
     )
 
     assert resolved_backends == [("torch_xpu", 0)]
+
+
+def test_unknown_runner_retries_xpu_resource_error_with_smaller_batch(
+    monkeypatch, tmp_path, capsys
+):
+    dataset_directory = generate_crps(
+        {"arbiter": 1},
+        n=8,
+        samples_per_instance=40,
+        seed=63,
+        data_root=tmp_path,
+        dataset_name="xpu-retry-data",
+    )
+    xpu_device = SimpleNamespace(type="xpu")
+    batch_sizes = []
+    cache_clears = []
+
+    monkeypatch.setattr(
+        experiment,
+        "_resolve_device",
+        lambda backend, device: xpu_device,
+    )
+    monkeypatch.setattr(
+        unknown_attack,
+        "_clear_xpu_cache",
+        lambda: cache_clears.append(True),
+    )
+
+    def attack_with_resource_failures(*args, **kwargs):
+        batch_sizes.append(args[11])
+        if len(batch_sizes) < 3:
+            raise RuntimeError(
+                "level_zero backend failed with error: "
+                "UR_RESULT_ERROR_OUT_OF_RESOURCES"
+            )
+        _, _, test = kwargs["crp_splits"]
+        test_responses = np.asarray(test.responses).reshape(
+            len(test.challenges), -1
+        )
+        matches = np.ones(len(test.challenges), dtype=bool)
+        sample_counts = (
+            len(kwargs["crp_splits"][0].challenges),
+            len(kwargs["crp_splits"][1].challenges),
+            len(test.challenges),
+        )
+        return {
+            "attack": "linear_logits",
+            "model_architecture": "linear_logits",
+            "depth": 0,
+            "validation_accuracy": 1.0,
+            "validation_element_accuracy": 1.0,
+            "test_accuracy": 1.0,
+            "test_element_accuracy": 1.0,
+            "training_samples": sample_counts[0],
+            "validation_samples": sample_counts[1],
+            "test_samples": sample_counts[2],
+            "epochs_trained": 0,
+            "fit_elapsed_seconds": 0.0,
+            "_response_rows": (
+                (test_responses > 0).astype(np.uint8),
+                (test_responses > 0).astype(np.uint8),
+                matches,
+            ),
+        }
+
+    monkeypatch.setattr(
+        experiment, "_attack_one_puf", attack_with_resource_failures
+    )
+    result = run_attack_unknown_puf(
+        dataset_directory,
+        bagging_runs=1,
+        candidate_families=["arbiter"],
+        attack_models=["linear_logits"],
+        batch_size=256,
+        backend="torch_xpu",
+        device=0,
+        report_root=tmp_path / "reports",
+        print_progress=True,
+    )
+
+    assert batch_sizes == [256, 128, 64]
+    assert cache_clears == [True, True]
+    output = capsys.readouterr().out
+    assert "model_type='linear_logits'" in output
+    assert "architecture='linear_logits'" in output
+    assert (
+        result["instances"][0]["trials"][0]["effective_batch_size"] == 64
+    )
+    response_file = Path(result["report_directory"]) / "responses.csv"
+    with response_file.open(encoding="utf-8", newline="") as handle:
+        response_rows = list(csv.DictReader(handle))
+    assert response_rows[0]["effective_batch_size"] == "64"
+    candidate_scores_file = (
+        Path(result["report_directory"]) / "candidate_scores.csv"
+    )
+    with candidate_scores_file.open(
+        encoding="utf-8", newline=""
+    ) as handle:
+        candidate_score_rows = list(csv.DictReader(handle))
+    assert candidate_score_rows[0]["effective_batch_size"] == "64"
+    results_file = Path(result["report_directory"]) / "results.json"
+    with results_file.open(encoding="utf-8") as handle:
+        report_results = json.load(handle)
+    assert (
+        report_results["instances"][0]["trials"][0]["effective_batch_size"]
+        == 64
+    )
 
 
 def test_unknown_runner_reports_incompatible_family_hypotheses(tmp_path):

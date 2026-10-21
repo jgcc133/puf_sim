@@ -50,6 +50,31 @@ CLEAR_PREVIOUS_LINE = "\033[1A\x1b[2K"
 CLEAR_LINE = "\r\033[2K"
 MODEL_SCREENING_EPOCHS = 10
 MODEL_SCREENING_THRESHOLD = 0.5
+PROGRESSIVE_VALIDATION_GATES = {
+    30: (0.15, 0.0),
+    50: (0.25, 0.5),
+    80: (0.4, 0.9),
+    100: (0.5, 0.92),
+}
+PROGRESSIVE_GATE_BASE_EPOCHS = 200
+
+
+def _progressive_validation_checkpoints(
+    epoch_limit: int,
+) -> dict[int, tuple[int, float]]:
+    checkpoints = {
+        max(milestone, int(np.ceil(fraction * epoch_limit))):
+        (milestone, threshold)
+        for milestone, (fraction, threshold)
+        in PROGRESSIVE_VALIDATION_GATES.items()
+        if max(milestone, int(np.ceil(fraction * epoch_limit))) <= epoch_limit
+    }
+    return checkpoints
+
+
+def _print_progress_line(message: str, end: str = "") -> None:
+    print(CLEAR_LINE, end="", flush=True)
+    print(message, end=end, flush=True)
 
 
 def _normalize_family_key(family: str) -> str:
@@ -478,6 +503,7 @@ def _attack_one_puf(
     crp_splits: Optional[
         tuple[ChallengeResponseSet, ChallengeResponseSet, ChallengeResponseSet]
     ] = None,
+    progressive_screening: bool = False,
 ) -> Dict[str, Any]:
     if crp_splits is None:
         training = ChallengeResponseSet.from_simulation(
@@ -508,6 +534,8 @@ def _attack_one_puf(
     early_stopped = False
     early_stop_reason: Optional[str] = None
     stage_history: list[Dict[str, Any]] = []
+    excluded_depths: list[Dict[str, Any]] = []
+    progressive_checkpoints = _progressive_validation_checkpoints(epochs)
 
     family_key = _normalize_family_key(family)
     select_by_element_accuracy = (
@@ -848,14 +876,23 @@ def _attack_one_puf(
         "staged_split",
     }:
         stages = [(0, agents)]
-    elif family_key in {"ring_oscillator", "memristive"}:
+    elif (
+        family_key in {"ring_oscillator", "memristive"}
+        and attack_model != "fc_lstm"
+    ):
         stages = [(0, agents)]
     else:
         stages = [(layer_count, agents) for layer_count in range(1, max_depth + 1)]
     for depth, agent_count in stages:
-        if threshold_reached or early_stopped:
+        if not progressive_screening and (threshold_reached or early_stopped):
             break
         trainers = []
+        depth_best_model: Optional[Simulation] = None
+        depth_best_validation_accuracy = -1.0
+        depth_best_validation_element_accuracy = -1.0
+        depth_best_selection_key = (-1.0, -1.0)
+        depth_best_agent_count = agent_count
+        depth_excluded = False
         trainer_setup_start = time.perf_counter()
         for agent_index in range(agent_count):
             trainer_arguments = (
@@ -929,7 +966,7 @@ def _attack_one_puf(
                 and attack_model == "neural"
             ):
                 trainers.append(trainer_type(*trainer_arguments, chain_count=target.k))
-            elif family_key == "interpose":
+            elif family_key == "interpose" and attack_model == "neural":
                 trainers.append(trainer_type(
                     *trainer_arguments,
                     down_chain_count=target.down.k,
@@ -940,12 +977,13 @@ def _attack_one_puf(
         trainer_setup_seconds = time.perf_counter() - trainer_setup_start
         fit_seconds += trainer_setup_seconds
         if print_progress:
-            print(f"\nCreated {agent_count} trainers for depth {depth}.")
+            print(f"Created {agent_count} trainers for depth {depth}.")
         stage_history.append({
             "attack": stage_name,
             "depth": depth,
             "agents": agent_count,
             "epochs": 0,
+            "status": "training" if progressive_screening else "complete",
             "activation_types": _model_profile(
                 family_key, depth, attack_model, device
             ),
@@ -1047,7 +1085,7 @@ def _attack_one_puf(
                     f"{latest_event['lr']:.1e}"
                     f" (EMA {latest_event['ema']:.4%})"
                 )
-            if epochs_trained <= MODEL_SCREENING_EPOCHS:
+            if not progressive_screening and epochs_trained <= MODEL_SCREENING_EPOCHS:
                 screening_element_accuracy = max(
                     screening_element_accuracy, validation_element_accuracy
                 )
@@ -1081,24 +1119,22 @@ def _attack_one_puf(
                         for trainer in trainers
                     ],
                     "lr_events": lr_events,
-                })
+                }                )
+            progress_line = ""
             if print_progress:
-                print(CLEAR_LINE, end="", flush=True)
                 validation_note = (
                     f"validation accuracy {validation_accuracy:.4%}"
                 )
                 if select_by_element_accuracy:
                     validation_note += (
-                        f", per-bit accuracy {validation_element_accuracy:.4%}"
+                        f", per-bit accuracy "
+                        f"{validation_element_accuracy:.4%}"
                     )
-                
-                print(
+                progress_line = (
                     f"Depth {depth}, trainers {agent_count}, "
                     f"epoch {stage_history[-1]['epochs']}/{epochs}, "
                     f"{validation_note}"
-                    f"{lr_note}",
-                    end="",
-                    flush=True,
+                    f"{lr_note}"
                 )
 
             validation_selection_key = _validation_selection_key(
@@ -1107,10 +1143,10 @@ def _attack_one_puf(
                 validation_accuracy,
                 validation_element_accuracy,
             )
-            if validation_selection_key > best_validation_selection_key:
+            if validation_selection_key > depth_best_selection_key:
                 import torch
 
-                best_model = build_attack_model(
+                depth_best_model = build_attack_model(
                     [
                         copy.deepcopy(trainer_model).cpu()
                         for trainer_model in selected_trainer_models
@@ -1118,22 +1154,23 @@ def _attack_one_puf(
                     torch.device("cpu"),
                     response_thresholds=selected_response_thresholds,
                 )
-                best_validation_accuracy = validation_accuracy
-                best_validation_element_accuracy = validation_element_accuracy
-                best_validation_selection_key = validation_selection_key
-                selected_stage = stage_name
-                selected_depth = depth
-                selected_agent_count = len(selected_trainer_models)
+                depth_best_validation_accuracy = validation_accuracy
+                depth_best_validation_element_accuracy = (
+                    validation_element_accuracy
+                )
+                depth_best_selection_key = validation_selection_key
+                depth_best_agent_count = len(selected_trainer_models)
 
             if validation_accuracy >= success_threshold:
                 threshold_reached = True
                 if print_progress:
-                    print(
-                        "\nSuccess threshold reached with validation accuracy "
-                        f"{validation_accuracy:.4%}"
+                    _print_progress_line(
+                        progress_line + " | success threshold reached"
                     )
                 break
             if (
+                not progressive_screening
+                and
                 not screening_passed
                 and epochs_trained >= MODEL_SCREENING_EPOCHS
                 and screening_element_accuracy <= MODEL_SCREENING_THRESHOLD
@@ -1144,19 +1181,116 @@ def _attack_one_puf(
                     f"within the first {MODEL_SCREENING_EPOCHS} epochs."
                 )
                 if print_progress:
-                    print("\n" + early_stop_reason + " Stopping this model.")
+                    _print_progress_line(
+                        progress_line + f" | {early_stop_reason}"
+                    )
+                break
+            depth_epoch = stage_history[-1]["epochs"]
+            checkpoint = progressive_checkpoints.get(depth_epoch)
+            checkpoint_threshold = checkpoint[1] if checkpoint else None
+            checkpoint_failed = (
+                progressive_screening
+                and checkpoint_threshold is not None
+                and (
+                    validation_accuracy == 0.0
+                    if checkpoint[0] == 30
+                    else validation_accuracy < checkpoint_threshold
+                )
+            )
+            if checkpoint_failed:
+                depth_excluded = True
+                exclusion = {
+                    "depth": depth,
+                    "epoch": depth_epoch,
+                    "reference_gate_epoch": checkpoint[0],
+                    "validation_accuracy": float(validation_accuracy),
+                    "minimum_validation_accuracy": checkpoint_threshold,
+                }
+                excluded_depths.append(exclusion)
+                stage_history[-1]["status"] = "excluded"
+                stage_history[-1]["exclusion_reason"] = (
+                    f"Validation accuracy {validation_accuracy:.4%} "
+                    f"failed the scaled epoch-{checkpoint[0]} gate "
+                    f"(scheduled at epoch {depth_epoch}) of "
+                    f"{checkpoint_threshold:.0%}."
+                )
+                if print_progress:
+                    _print_progress_line(
+                        progress_line
+                        + f" | excluded at scaled epoch-{checkpoint[0]} gate "
+                        f"(minimum {checkpoint_threshold:.0%})"
+                    )
                 break
             if stage_history[-1]["epochs"] >= epochs:
                 if print_progress:
-                    print(
-                        f"\nMaximum epochs reached for depth {depth} with validation "
-                        f"accuracy {validation_accuracy:.4%}"
+                    _print_progress_line(
+                        progress_line + " | maximum epochs reached"
                     )
                 break
+            if print_progress:
+                _print_progress_line(progress_line)
+        if print_progress:
+            print()
+        if not depth_excluded:
+            stage_history[-1]["status"] = "complete"
+            if depth_best_model is not None and (
+                depth_best_selection_key > best_validation_selection_key
+            ):
+                best_model = depth_best_model
+                best_validation_accuracy = depth_best_validation_accuracy
+                best_validation_element_accuracy = (
+                    depth_best_validation_element_accuracy
+                )
+                best_validation_selection_key = depth_best_selection_key
+                selected_stage = stage_name
+                selected_depth = depth
+                selected_agent_count = depth_best_agent_count
         if threshold_reached:
             break
 
     if best_model is None:
+        if progressive_screening and excluded_depths:
+            best_exclusion = max(
+                excluded_depths,
+                key=lambda exclusion: exclusion["validation_accuracy"],
+            )
+            reason = "All trainable depths were excluded by validation gates."
+            return {
+                "attack": stage_name,
+                "model_family": family_key,
+                "model_architecture": attack_model,
+                "activation_types": _model_profile(
+                    family_key, 0, attack_model, device
+                ),
+                "depth": None,
+                "agents": 0,
+                "validation_accuracy": best_exclusion["validation_accuracy"],
+                "validation_element_accuracy": None,
+                "selection_metric": "complete_response_accuracy",
+                "test_accuracy": None,
+                "test_element_accuracy": None,
+                "matched_test_responses": None,
+                "test_response_count": len(test.challenges),
+                "success_threshold": success_threshold,
+                "success": False,
+                "threshold_reached": False,
+                "candidate_excluded": True,
+                "exclusion_reason": reason,
+                "excluded_depths": excluded_depths,
+                "early_stopped": True,
+                "early_stop_reason": reason,
+                "epochs_to_threshold": None,
+                "time_to_threshold_seconds": None,
+                "epochs_trained": epochs_trained,
+                "agent_epochs_trained": agent_epochs_trained,
+                "epochs_per_depth_limit": epochs,
+                "training_samples": training_samples,
+                "validation_samples": validation_samples,
+                "test_samples": test_samples,
+                "fit_elapsed_seconds": float(fit_seconds),
+                "stages": stage_history,
+                "_response_rows": None,
+            }
         raise RuntimeError("No attack model was trained.")
     validation_accuracy = best_validation_accuracy
     test_responses = np.asarray(test.responses).reshape(len(test.challenges), -1)
@@ -1204,6 +1338,8 @@ def _attack_one_puf(
         "success_threshold": success_threshold,
         "success": test_accuracy >= success_threshold,
         "threshold_reached": threshold_reached,
+        "candidate_excluded": False,
+        "excluded_depths": excluded_depths,
         "early_stopped": early_stopped,
         "early_stop_reason": early_stop_reason,
         "epochs_to_threshold": epochs_trained if threshold_reached else None,

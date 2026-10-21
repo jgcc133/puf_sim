@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
@@ -331,6 +333,7 @@ def _candidate_specs(
     candidate_families: Sequence[str],
     attack_models: Optional[Sequence[str]],
     continuous_responses: bool = False,
+    candidate_model_types: Optional[Mapping[str, set[str]]] = None,
 ) -> list[dict[str, Any]]:
     allowed_models = None if attack_models is None else {
         model.strip().lower() for model in attack_models
@@ -353,6 +356,17 @@ def _candidate_specs(
             allowed_models is not None
             and attack_model not in allowed_models
             and not (is_auto and "auto" in allowed_models)
+        ):
+            return
+        family_models = (
+            None
+            if candidate_model_types is None
+            else candidate_model_types.get(family)
+        )
+        if (
+            family_models is not None
+            and attack_model not in family_models
+            and not (is_auto and "auto" in family_models)
         ):
             return
         seen.add(key)
@@ -442,6 +456,9 @@ def _attack_summary(
     result: Mapping[str, Any], candidate: Mapping[str, Any], bagging_run: int
 ) -> dict[str, Any]:
     return {
+        "status": (
+            "excluded" if result.get("candidate_excluded", False) else "trained"
+        ),
         "bagging_run": bagging_run,
         "family_hypothesis": candidate["family_hypothesis"],
         "model_type": candidate["attack_model"],
@@ -456,7 +473,177 @@ def _attack_summary(
         "test_samples": result["test_samples"],
         "epochs_trained": result["epochs_trained"],
         "fit_elapsed_seconds": result["fit_elapsed_seconds"],
+        "exclusion_reason": result.get("exclusion_reason"),
+        "excluded_depths": result.get("excluded_depths", []),
     }
+
+
+def _rank_trials(
+    trial_records: Sequence[Mapping[str, Any]],
+) -> tuple[
+    Optional[dict[str, Any]],
+    Optional[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    if not trial_records:
+        return None, None, []
+
+    grouped_trials: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for trial in trial_records:
+        summary = trial["summary"]
+        group_key = (
+            summary["family_hypothesis"],
+            summary["model_type"],
+        )
+        grouped_trials.setdefault(group_key, []).append(trial)
+    model_summaries = []
+    for (family_hypothesis, model_type), grouped in grouped_trials.items():
+        model_summaries.append({
+            "family_hypothesis": family_hypothesis,
+            "model_type": model_type,
+            "bagging_runs": len(grouped),
+            "mean_validation_accuracy": float(np.mean([
+                trial["summary"]["validation_accuracy"]
+                for trial in grouped
+            ])),
+            "mean_validation_element_accuracy": float(np.mean([
+                trial["summary"]["validation_element_accuracy"]
+                for trial in grouped
+            ])),
+            "mean_test_accuracy": float(np.mean([
+                trial["summary"]["test_accuracy"]
+                for trial in grouped
+            ])),
+            "mean_test_element_accuracy": float(np.mean([
+                trial["summary"]["test_element_accuracy"]
+                for trial in grouped
+            ])),
+        })
+    best_validation_group = max(
+        model_summaries,
+        key=lambda summary: (
+            summary["mean_validation_accuracy"],
+            summary["mean_validation_element_accuracy"],
+        ),
+    )
+    selected_validation_trials = grouped_trials[
+        (
+            best_validation_group["family_hypothesis"],
+            best_validation_group["model_type"],
+        )
+    ]
+    best_validation_trial = max(
+        selected_validation_trials,
+        key=lambda trial: (
+            trial["summary"]["validation_accuracy"],
+            trial["summary"]["validation_element_accuracy"],
+        ),
+    )
+    best_validation = {
+        **best_validation_trial,
+        "summary": {
+            **best_validation_trial["summary"],
+            **best_validation_group,
+            "selected_bagging_run": (
+                best_validation_trial["summary"]["bagging_run"]
+            ),
+        },
+    }
+    best_test_oracle_trial = max(
+        trial_records,
+        key=lambda trial: (
+            trial["summary"]["test_accuracy"],
+            trial["summary"]["test_element_accuracy"],
+        ),
+    )
+    test_oracle_model_summary = next(
+        summary
+        for summary in model_summaries
+        if summary["family_hypothesis"]
+        == best_test_oracle_trial["summary"]["family_hypothesis"]
+        and summary["model_type"]
+        == best_test_oracle_trial["summary"]["model_type"]
+    )
+    best_test_oracle = {
+        **best_test_oracle_trial,
+        "summary": {
+            **best_test_oracle_trial["summary"],
+            **test_oracle_model_summary,
+            "selected_bagging_run": (
+                best_test_oracle_trial["summary"]["bagging_run"]
+            ),
+        },
+    }
+    return best_validation, best_test_oracle, model_summaries
+
+
+def _rank_overall_trials(
+    trial_summaries: Sequence[Mapping[str, Any]],
+) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
+    grouped_trials: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    for trial in trial_summaries:
+        if trial["test_accuracy"] is None:
+            continue
+        group_key = (
+            trial["family_hypothesis"],
+            trial["model_type"],
+        )
+        grouped_trials.setdefault(group_key, []).append(trial)
+    if not grouped_trials:
+        return None, []
+
+    model_summaries = []
+    for (family_hypothesis, model_type), grouped in grouped_trials.items():
+        trials_by_instance: dict[str, list[Mapping[str, Any]]] = {}
+        for trial in grouped:
+            trials_by_instance.setdefault(trial["instance_id"], []).append(
+                trial
+            )
+        model_summaries.append({
+            "family_hypothesis": family_hypothesis,
+            "model_type": model_type,
+            "bagging_trials": len(grouped),
+            "instances": len(trials_by_instance),
+            "mean_test_accuracy": float(np.mean([
+                np.mean([
+                    trial["test_accuracy"] for trial in instance_trials
+                ])
+                for instance_trials in trials_by_instance.values()
+            ])),
+            "mean_test_element_accuracy": float(np.mean([
+                np.mean([
+                    trial["test_element_accuracy"]
+                    for trial in instance_trials
+                ])
+                for instance_trials in trials_by_instance.values()
+            ])),
+            "mean_trial_elapsed_seconds": float(np.mean([
+                trial["trial_elapsed_seconds"] for trial in grouped
+            ])),
+            "total_trial_elapsed_seconds": float(np.sum([
+                trial["trial_elapsed_seconds"] for trial in grouped
+            ])),
+        })
+    model_summaries.sort(
+        key=lambda summary: summary["mean_test_accuracy"],
+        reverse=True,
+    )
+    return model_summaries[0], model_summaries
+
+
+def _is_xpu_resource_error(error: RuntimeError) -> bool:
+    message = str(error).lower()
+    return (
+        "ur_result_error_out_of_resources" in message
+        or "out of resources" in message
+    )
+
+
+def _clear_xpu_cache() -> None:
+    import torch
+
+    gc.collect()
+    torch.xpu.empty_cache()
 
 
 def _report_directory(
@@ -489,6 +676,7 @@ def _write_response_csv(
             "bagging_run",
             "selection_basis",
             "model_type",
+            "effective_batch_size",
             "family_hypothesis",
             "test_accuracy",
             "sample_index",
@@ -497,7 +685,9 @@ def _write_response_csv(
             "match",
         ])
         for instance in chosen_instances:
-            winner = instance[selection_basis]
+            winner = instance.get(selection_basis)
+            if winner is None:
+                continue
             responses = winner["response_rows"]
             puf_responses, model_responses, row_matches = responses
             for sample_index, (puf_row, model_row, matched) in enumerate(
@@ -508,6 +698,7 @@ def _write_response_csv(
                     winner["summary"]["bagging_run"],
                     selection_basis,
                     winner["summary"]["model_type"],
+                    winner["summary"]["effective_batch_size"],
                     winner["summary"]["family_hypothesis"],
                     winner["summary"]["test_accuracy"],
                     sample_index,
@@ -515,6 +706,94 @@ def _write_response_csv(
                     json.dumps(np.asarray(model_row).tolist()),
                     int(matched),
                 ])
+
+
+def _serialize_instance_results(
+    instance_results: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            key: value
+            for key, value in instance.items()
+            if key not in {"best_validation_selected", "best_test_oracle"}
+        } | {
+            "best_validation_selected": (
+                instance["best_validation_selected"]["summary"]
+                if instance["best_validation_selected"] is not None
+                else None
+            ),
+            "best_test_oracle": (
+                instance["best_test_oracle"]["summary"]
+                if instance["best_test_oracle"] is not None
+                else None
+            ),
+            "bagging_model_summaries": instance["bagging_model_summaries"],
+        }
+        for instance in instance_results
+    ]
+
+
+def _write_unknown_report(
+    report_directory: Path,
+    results: Mapping[str, Any],
+    parameters: Mapping[str, Any],
+    all_trials: Sequence[Mapping[str, Any]],
+    instance_results: Sequence[Mapping[str, Any]],
+) -> None:
+    with (report_directory / "results.json").open(
+        "w", encoding="utf-8"
+    ) as handle:
+        json.dump(results, handle, indent=2)
+    with (report_directory / "parameters.json").open(
+        "w", encoding="utf-8"
+    ) as handle:
+        json.dump(parameters, handle, indent=2)
+    score_fields = [
+        "status",
+        "instance_id",
+        "bagging_run",
+        "family_hypothesis",
+        "model_type",
+        "attack",
+        "exclusion_reason",
+        "excluded_depths",
+        "effective_batch_size",
+        "depth",
+        "training_samples",
+        "validation_samples",
+        "test_samples",
+        "validation_accuracy",
+        "validation_element_accuracy",
+        "test_accuracy",
+        "test_element_accuracy",
+        "epochs_trained",
+        "fit_elapsed_seconds",
+        "trial_elapsed_seconds",
+        "total_elapsed_seconds",
+        "split_counts",
+    ]
+    with (report_directory / "candidate_scores.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=score_fields)
+        writer.writeheader()
+        for trial in all_trials:
+            row = dict(trial)
+            row["split_counts"] = json.dumps(row["split_counts"], sort_keys=True)
+            row["excluded_depths"] = json.dumps(
+                row["excluded_depths"], sort_keys=True
+            )
+            writer.writerow(row)
+    _write_response_csv(
+        report_directory / "responses.csv",
+        instance_results,
+        "best_test_oracle",
+    )
+    _write_response_csv(
+        report_directory / "responses_validation_selected.csv",
+        instance_results,
+        "best_validation_selected",
+    )
 
 
 def run_attack_unknown_puf(
@@ -528,7 +807,7 @@ def run_attack_unknown_puf(
     max_depth: int = 3,
     agents: int = 1,
     width: Optional[int] = None,
-    epochs: int = 100,
+    epochs: Optional[int] = None,
     batch_size: int = 256,
     learning_rate: float = 0.001,
     backend: str = "auto",
@@ -539,20 +818,45 @@ def run_attack_unknown_puf(
     scenario: str = "general",
     report_root: Optional[str | Path] = None,
     print_progress: bool = False,
+    max_total_epochs: Optional[int] = None,
+    candidate_model_types: Optional[
+        Mapping[str, Sequence[str] | str]
+    ] = None,
+    family_hypothesis: Optional[str | Sequence[str]] = None,
 ) -> dict[str, Any]:
     """Compare attack candidates over repeated disjoint 70/20/10 splits.
 
     Each CRP file is treated as one opaque PUF instance. By default, all
     supported families and their compatible attacks are tested. Families in
-    ``candidate_families`` are optional model hypotheses only; they are never
-    read from the CRP dataset. The test-set winner is reported as an oracle
-    result, because selecting a model by test accuracy uses test labels.
+    ``candidate_families`` and ``family_hypothesis`` select optional model
+    hypotheses only; they are never read from the CRP dataset.
+    ``candidate_model_types`` optionally restricts the attack models for
+    individual family hypotheses. The test-set winner is reported as an
+    oracle result, because selecting a model by test accuracy uses test labels.
     """
+    timer_started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    run_started = time.perf_counter()
     if bagging_runs < 1:
         raise ValueError("bagging_runs must be positive.")
-    if agents < 1 or max_depth < 1 or epochs < 1 or batch_size < 1:
+    if candidate_families is not None and family_hypothesis is not None:
         raise ValueError(
-            "agents, max_depth, epochs, and batch_size must be positive."
+            "Specify either candidate_families or family_hypothesis, not both."
+        )
+    if epochs is not None and max_total_epochs is not None:
+        raise ValueError("Specify either epochs or max_total_epochs, not both.")
+    effective_max_total_epochs = (
+        max_total_epochs
+        if max_total_epochs is not None
+        else epochs if epochs is not None else 200
+    )
+    if (
+        agents < 1
+        or max_depth < 1
+        or effective_max_total_epochs < 1
+        or batch_size < 1
+    ):
+        raise ValueError(
+            "agents, max_depth, max_total_epochs, and batch_size must be positive."
         )
     if not 0.5 < success_threshold <= 1.0:
         raise ValueError("success_threshold must be greater than 0.5 and at most 1.")
@@ -577,11 +881,60 @@ def run_attack_unknown_puf(
             )
         normalized_family_options[family_key] = option_values
     instances, manifest = _load_instances(dataset_path)
-    selected_families = (
-        _experiment.DEFAULT_ATTACK_FAMILIES
-        if candidate_families is None
+    selected_families_input = (
+        family_hypothesis
+        if family_hypothesis is not None
         else candidate_families
     )
+    if selected_families_input is None:
+        selected_families_input = _experiment.DEFAULT_ATTACK_FAMILIES
+    elif isinstance(selected_families_input, str):
+        selected_families_input = [selected_families_input]
+    selected_families = list(dict.fromkeys(
+        _canonical_family(family) for family in selected_families_input
+    ))
+    if not selected_families:
+        raise ValueError("At least one candidate PUF family is required.")
+
+    normalized_candidate_model_types: Optional[dict[str, set[str]]] = None
+    if candidate_model_types is not None:
+        if not candidate_model_types:
+            raise ValueError("candidate_model_types cannot be empty.")
+        normalized_candidate_model_types = {}
+        for family, model_types in candidate_model_types.items():
+            family_key = _canonical_family(family)
+            if family_key not in selected_families:
+                raise ValueError(
+                    f"candidate_model_types family {family!r} is not selected "
+                    "by family_hypothesis/candidate_families."
+                )
+            if isinstance(model_types, str):
+                model_values = [model_types]
+            elif isinstance(model_types, Sequence):
+                model_values = model_types
+            else:
+                raise ValueError(
+                    f"candidate_model_types for {family!r} must be a model "
+                    "type or a sequence of model types."
+                )
+            if not all(
+                isinstance(model, str) and model.strip()
+                for model in model_values
+            ):
+                raise ValueError(
+                    f"candidate_model_types for {family!r} must contain "
+                    "non-empty model type names."
+                )
+            normalized_models = {
+                model.strip().lower()
+                for model in model_values
+            }
+            if not normalized_models:
+                raise ValueError(
+                    f"candidate_model_types for {family!r} must contain at "
+                    "least one model type."
+                )
+            normalized_candidate_model_types[family_key] = normalized_models
     dataset_id = str(manifest.get("dataset_id", Path(dataset_path).stem))
     report_root_path = (
         DEFAULT_UNKNOWN_REPORT_ROOT
@@ -591,6 +944,8 @@ def run_attack_unknown_puf(
     report_directory = _report_directory(
         report_root_path, scenario, dataset_id
     )
+    if print_progress:
+        print(f"Timer started at {timer_started_at}.")
 
     instance_results = []
     all_trials = []
@@ -610,6 +965,7 @@ def run_attack_unknown_puf(
             selected_families,
             attack_models,
             continuous_responses=is_continuous,
+            candidate_model_types=normalized_candidate_model_types,
         )
         targets: dict[str, Any] = {}
         skipped_candidates = []
@@ -666,6 +1022,7 @@ def run_attack_unknown_puf(
             ).add(family_hypothesis)
 
         trial_records: list[dict[str, Any]] = []
+        instance_trials: list[dict[str, Any]] = []
         for bagging_run in range(1, bagging_runs + 1):
             split_seed = seed + instance_index * bagging_runs + bagging_run
             train_indices, validation_indices, test_indices = _split_indices(
@@ -697,133 +1054,112 @@ def run_attack_unknown_puf(
                     or (attack_model == "svm" and normalized_backend == "cpu")
                     else _experiment._resolve_device(backend, device)
                 )
-                result = _experiment._attack_one_puf(
-                    target,
-                    n,
-                    split_counts["training"],
-                    split_counts["validation"],
-                    split_counts["test"],
-                    candidate_seed + 1,
-                    success_threshold,
-                    max_depth,
-                    agents,
-                    width,
-                    epochs,
-                    batch_size,
-                    learning_rate,
-                    training_device,
-                    family_hypothesis,
-                    print_progress,
-                    attack_model,
-                    crp_splits=(
-                        split_arrays[0],
-                        split_arrays[1],
-                        split_arrays[2],
-                    ),
-                )
+                effective_batch_size = batch_size
+                trial_started = time.perf_counter()
+                if print_progress:
+                    print(
+                        f"\nRunning candidate for {instance_id}, "
+                        f"split {bagging_run}/{bagging_runs}: "
+                        f"family_hypothesis={family_hypothesis!r}, "
+                        f"model_type={attack_model!r}, "
+                        f"batch_size={effective_batch_size}."
+                    )
+                while True:
+                    retry_batch_size: Optional[int] = None
+                    try:
+                        result = _experiment._attack_one_puf(
+                            target,
+                            n,
+                            split_counts["training"],
+                            split_counts["validation"],
+                            split_counts["test"],
+                            candidate_seed + 1,
+                            success_threshold,
+                            max_depth,
+                            agents,
+                            width,
+                            effective_max_total_epochs,
+                            effective_batch_size,
+                            learning_rate,
+                            training_device,
+                            family_hypothesis,
+                            print_progress,
+                            attack_model,
+                            crp_splits=(
+                                split_arrays[0],
+                                split_arrays[1],
+                                split_arrays[2],
+                            ),
+                            progressive_screening=True,
+                        )
+                    except RuntimeError as error:
+                        if (
+                            getattr(training_device, "type", None) != "xpu"
+                            or not _is_xpu_resource_error(error)
+                            or effective_batch_size == 1
+                        ):
+                            raise
+                        retry_batch_size = max(1, effective_batch_size // 2)
+                        if print_progress:
+                            print(
+                                f"\nXPU resources exhausted for "
+                                f"{family_hypothesis}/{attack_model}; "
+                                f"retrying with batch_size={retry_batch_size}."
+                            )
+                    if retry_batch_size is None:
+                        break
+                    _clear_xpu_cache()
+                    effective_batch_size = retry_batch_size
+                trial_elapsed_seconds = time.perf_counter() - trial_started
+                total_elapsed_seconds = time.perf_counter() - run_started
                 summary = _attack_summary(result, candidate, bagging_run)
+                summary["effective_batch_size"] = effective_batch_size
                 summary["instance_id"] = instance_id
                 summary["split_counts"] = split_counts
+                summary["trial_elapsed_seconds"] = trial_elapsed_seconds
+                summary["total_elapsed_seconds"] = total_elapsed_seconds
+                if result.get("candidate_excluded", False):
+                    summary["test_accuracy"] = None
+                    summary["test_element_accuracy"] = None
+                    summary["matched_test_responses"] = None
+                    summary["test_response_count"] = split_counts["test"]
+                    all_trials.append(summary)
+                    instance_trials.append(summary)
+                    if print_progress:
+                        print(
+                            f"{instance_id}, split {bagging_run}/{bagging_runs}: "
+                            f"family_hypothesis={family_hypothesis!r}, "
+                            f"model_type={attack_model!r} excluded: "
+                            f"{summary['exclusion_reason']}; "
+                            f"lap_elapsed={trial_elapsed_seconds:.2f}s, "
+                            f"total_elapsed={total_elapsed_seconds:.2f}s"
+                        )
+                    continue
                 trial = {
                     "summary": summary,
                     "response_rows": result["_response_rows"],
                 }
                 trial_records.append(trial)
                 all_trials.append(summary)
+                instance_trials.append(summary)
                 if print_progress:
                     print(
-                        f"{instance_id}, split {bagging_run}/{bagging_runs}, "
-                        f"{family_hypothesis}/{attack_model}: "
+                        f"{instance_id}, split {bagging_run}/{bagging_runs}: "
+                        f"family_hypothesis={family_hypothesis!r}, "
+                        f"model_type={attack_model!r}, "
+                        f"architecture="
+                        f"{result.get('model_architecture', attack_model)!r}, "
+                        f"attack_stage={summary['attack']!r}, "
+                        f"batch_size={effective_batch_size}, "
                         f"validation={summary['validation_accuracy']:.4%}, "
-                        f"test={summary['test_accuracy']:.4%}"
+                        f"test={summary['test_accuracy']:.4%}, "
+                        f"lap_elapsed={trial_elapsed_seconds:.2f}s, "
+                        f"total_elapsed={total_elapsed_seconds:.2f}s"
                     )
 
-        grouped_trials: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for trial in trial_records:
-            summary = trial["summary"]
-            group_key = (
-                summary["family_hypothesis"],
-                summary["model_type"],
-            )
-            grouped_trials.setdefault(group_key, []).append(trial)
-        bagging_model_summaries = []
-        for (family_hypothesis, model_type), grouped in grouped_trials.items():
-            bagging_model_summaries.append({
-                "family_hypothesis": family_hypothesis,
-                "model_type": model_type,
-                "bagging_runs": len(grouped),
-                "mean_validation_accuracy": float(np.mean([
-                    trial["summary"]["validation_accuracy"]
-                    for trial in grouped
-                ])),
-                "mean_validation_element_accuracy": float(np.mean([
-                    trial["summary"]["validation_element_accuracy"]
-                    for trial in grouped
-                ])),
-                "mean_test_accuracy": float(np.mean([
-                    trial["summary"]["test_accuracy"]
-                    for trial in grouped
-                ])),
-                "mean_test_element_accuracy": float(np.mean([
-                    trial["summary"]["test_element_accuracy"]
-                    for trial in grouped
-                ])),
-            })
-        best_validation_group = max(
-            bagging_model_summaries,
-            key=lambda summary: (
-                summary["mean_validation_accuracy"],
-                summary["mean_validation_element_accuracy"],
-            ),
+        best_validation, best_test_oracle, bagging_model_summaries = (
+            _rank_trials(trial_records)
         )
-        selected_validation_trials = grouped_trials[
-            (
-                best_validation_group["family_hypothesis"],
-                best_validation_group["model_type"],
-            )
-        ]
-        best_validation_trial = max(
-            selected_validation_trials,
-            key=lambda trial: (
-                trial["summary"]["validation_accuracy"],
-                trial["summary"]["validation_element_accuracy"],
-            ),
-        )
-        best_validation = {
-            **best_validation_trial,
-            "summary": {
-                **best_validation_trial["summary"],
-                **best_validation_group,
-                "selected_bagging_run": (
-                    best_validation_trial["summary"]["bagging_run"]
-                ),
-            },
-        }
-        best_test_oracle = max(
-            trial_records,
-            key=lambda trial: (
-                trial["summary"]["test_accuracy"],
-                trial["summary"]["test_element_accuracy"],
-            ),
-        )
-        test_oracle_model_summary = next(
-            summary
-            for summary in bagging_model_summaries
-            if summary["family_hypothesis"]
-            == best_test_oracle["summary"]["family_hypothesis"]
-            and summary["model_type"]
-            == best_test_oracle["summary"]["model_type"]
-        )
-        best_test_oracle = {
-            **best_test_oracle,
-            "summary": {
-                **best_test_oracle["summary"],
-                **test_oracle_model_summary,
-                "selected_bagging_run": (
-                    best_test_oracle["summary"]["bagging_run"]
-                ),
-            },
-        }
         instance_results.append({
             "instance_id": instance_id,
             "sample_count": len(challenges),
@@ -835,132 +1171,132 @@ def run_attack_unknown_puf(
             "best_validation_selected": best_validation,
             "best_test_oracle": best_test_oracle,
             "bagging_model_summaries": bagging_model_summaries,
-            "trials": [
-                trial["summary"] for trial in trial_records
+            "trials": instance_trials,
+        })
+        overall_elapsed_seconds = time.perf_counter() - run_started
+        best_guessed_model, overall_model_summaries = _rank_overall_trials(
+            all_trials
+        )
+        results = {
+            "best_guessed_model": best_guessed_model,
+            "overall_summary": {
+                "timer_started_at": timer_started_at,
+                "total_elapsed_seconds": overall_elapsed_seconds,
+                "completed_instances": len(instance_results),
+                "completed_trials": len(all_trials),
+                "ranking_metric": "mean_test_accuracy_across_successful_bagged_trials",
+                "test_accuracy_is_used_for_model_ranking": True,
+            },
+            "dataset_id": dataset_id,
+            "instance_count": len(instances),
+            "bagging_runs": bagging_runs,
+            "overall_model_summaries": overall_model_summaries,
+            "selection_policy": {
+                "primary": "highest_validation_accuracy_then_element_accuracy",
+                "test_oracle": (
+                    "Highest test accuracy across candidates and bagging splits; "
+                    "test-set-selected and not an unbiased generalization estimate."
+                ),
+                "progressive_screening": {
+                    "enabled": True,
+                    "max_total_epochs_per_depth": effective_max_total_epochs,
+                    "reference_epoch_cap": (
+                        _experiment.PROGRESSIVE_GATE_BASE_EPOCHS
+                    ),
+                    "gate_fractions_of_reference_epoch_cap": {
+                        str(milestone): fraction
+                        for milestone, (fraction, _) in
+                        _experiment.PROGRESSIVE_VALIDATION_GATES.items()
+                    },
+                    "gate_epoch_rule": (
+                        "max(reference_gate_epoch, "
+                        "ceil(fraction * max_total_epochs))"
+                    ),
+                    "validation_accuracy_gates": {
+                        "reference_epoch_30": "exclude only when accuracy is exactly 0%",
+                        "reference_epoch_50": "exclude below 50%",
+                        "reference_epoch_80": "exclude below 90%",
+                        "reference_epoch_100": "exclude below 92%",
+                    },
+                    "threshold_metric": "complete_response_validation_accuracy",
+                    "stop_candidate_when_success_threshold_reached": True,
+                    "excluded_depths_are_restarted_at_each_candidate_depth": True,
+                    "candidates_without_surviving_depths_are_not_ranked": True,
+                    "gates_after_epoch_cap_are_not_reached": True,
+                },
+            },
+            "auto_selected_attack_to_families": {
+                model: sorted(families)
+                for model, families in sorted(auto_routes.items())
+            },
+            "model_to_compatible_family_hypotheses": {
+                model: sorted(families)
+                for model, families in sorted(compatible_routes.items())
+            },
+            "instances": _serialize_instance_results(instance_results),
+        }
+        parameters = {
+            "dataset_path": str(Path(dataset_path)),
+            "dataset_id": dataset_id,
+            "seed": seed,
+            "bagging_runs": bagging_runs,
+            "split_ratios": {"training": 0.7, "validation": 0.2, "test": 0.1},
+            "k_hypothesis": k,
+            "candidate_families": [
+                _canonical_family(family) for family in selected_families
             ],
-        })
-
-    serializable_instances = []
-    for instance in instance_results:
-        serializable_instances.append({
-            key: value
-            for key, value in instance.items()
-            if key not in {"best_validation_selected", "best_test_oracle"}
-        } | {
-            "best_validation_selected":
-                instance["best_validation_selected"]["summary"],
-            "best_test_oracle": instance["best_test_oracle"]["summary"],
-            "bagging_model_summaries":
-                instance["bagging_model_summaries"],
-        })
-    results = {
-        "dataset_id": dataset_id,
-        "instance_count": len(instance_results),
-        "bagging_runs": bagging_runs,
-        "selection_policy": {
-            "primary": "highest_validation_accuracy_then_element_accuracy",
-            "test_oracle": (
-                "Highest test accuracy across candidates and bagging splits; "
-                "test-set-selected and not an unbiased generalization estimate."
+            "family_hypothesis": selected_families,
+            "attack_models": (
+                list(attack_models) if attack_models is not None else "all"
             ),
-        },
-        "auto_selected_attack_to_families": {
-            model: sorted(families)
-            for model, families in sorted(auto_routes.items())
-        },
-        "model_to_compatible_family_hypotheses": {
-            model: sorted(families)
-            for model, families in sorted(compatible_routes.items())
-        },
-        "instances": serializable_instances,
-    }
-    parameters = {
-        "dataset_path": str(Path(dataset_path)),
-        "dataset_id": dataset_id,
-        "seed": seed,
-        "bagging_runs": bagging_runs,
-        "split_ratios": {"training": 0.7, "validation": 0.2, "test": 0.1},
-        "k_hypothesis": k,
-        "candidate_families": [
-            _canonical_family(family) for family in selected_families
-        ],
-        "attack_models": list(attack_models) if attack_models is not None else "all",
-        "success_threshold": success_threshold,
-        "max_depth": max_depth,
-        "agents": agents,
-        "width": width,
-        "epochs": epochs,
-        "batch_size": batch_size,
-        "learning_rate": learning_rate,
-        "backend": backend,
-        "device": device,
-        "noisiness_hypothesis": noisiness,
-        "bch_correction_capacity": bch_correction_capacity,
-        "family_options": normalized_family_options,
-        "candidate_count_by_instance": {
-            instance["instance_id"]: instance["candidate_count"]
-            for instance in instance_results
-        },
-        "skipped_candidates_by_instance": {
-            instance["instance_id"]: instance["skipped_candidates"]
-            for instance in instance_results
-            if instance["skipped_candidates"]
-        },
-        "instances": [
-            {
-                "instance_id": instance["instance_id"],
-                "sample_count": instance["sample_count"],
-                "challenge_length": instance["challenge_length"],
-                "response_length": instance["response_length"],
-            }
-            for instance in instance_results
-        ],
-    }
-    with (report_directory / "results.json").open(
-        "w", encoding="utf-8"
-    ) as handle:
-        json.dump(results, handle, indent=2)
-    with (report_directory / "parameters.json").open(
-        "w", encoding="utf-8"
-    ) as handle:
-        json.dump(parameters, handle, indent=2)
-    score_fields = [
-        "instance_id",
-        "bagging_run",
-        "family_hypothesis",
-        "model_type",
-        "attack",
-        "depth",
-        "training_samples",
-        "validation_samples",
-        "test_samples",
-        "validation_accuracy",
-        "validation_element_accuracy",
-        "test_accuracy",
-        "test_element_accuracy",
-        "epochs_trained",
-        "fit_elapsed_seconds",
-        "split_counts",
-    ]
-    with (report_directory / "candidate_scores.csv").open(
-        "w", newline="", encoding="utf-8"
-    ) as handle:
-        writer = csv.DictWriter(handle, fieldnames=score_fields)
-        writer.writeheader()
-        for trial in all_trials:
-            row = dict(trial)
-            row["split_counts"] = json.dumps(row["split_counts"], sort_keys=True)
-            writer.writerow(row)
-    _write_response_csv(
-        report_directory / "responses.csv",
-        instance_results,
-        "best_test_oracle",
-    )
-    _write_response_csv(
-        report_directory / "responses_validation_selected.csv",
-        instance_results,
-        "best_validation_selected",
-    )
+            "candidate_model_types": (
+                {
+                    family: sorted(model_types)
+                    for family, model_types in
+                    normalized_candidate_model_types.items()
+                }
+                if normalized_candidate_model_types is not None
+                else "default_by_family"
+            ),
+            "success_threshold": success_threshold,
+            "max_depth": max_depth,
+            "agents": agents,
+            "width": width,
+            "epochs": epochs,
+            "max_total_epochs": effective_max_total_epochs,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "backend": backend,
+            "device": device,
+            "noisiness_hypothesis": noisiness,
+            "bch_correction_capacity": bch_correction_capacity,
+            "family_options": normalized_family_options,
+            "candidate_count_by_instance": {
+                instance["instance_id"]: instance["candidate_count"]
+                for instance in instance_results
+            },
+            "skipped_candidates_by_instance": {
+                instance["instance_id"]: instance["skipped_candidates"]
+                for instance in instance_results
+                if instance["skipped_candidates"]
+            },
+            "instances": [
+                {
+                    "instance_id": instance["instance_id"],
+                    "sample_count": instance["sample_count"],
+                    "challenge_length": instance["challenge_length"],
+                    "response_length": instance["response_length"],
+                }
+                for instance in instance_results
+            ],
+        }
+        _write_unknown_report(
+            report_directory,
+            results,
+            parameters,
+            all_trials,
+            instance_results,
+        )
     return {
         **results,
         "report_directory": str(report_directory),
